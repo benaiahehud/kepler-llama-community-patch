@@ -59,8 +59,10 @@ template<typename dst_t, typename src_t>
         // bypass compile error on cuda 12.0.1
 #ifdef GGML_USE_HIP
         return __float22bfloat162_rn(x);
-#else
+#elif CUDART_VERSION >= 11000 || !defined(CUDART_VERSION)
         return {x.x, x.y};
+#else
+        return __float22half2_rn(x);
 #endif // GGML_USE_HIP
     } else if constexpr(std::is_same_v<dst_t, int32_t>) {
         return int32_t(x);

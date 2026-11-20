@@ -2077,27 +2077,31 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
                 }
             }
         } else
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif // CUDART_VERSION > 8000 || (!defined(CUDART_VERSION) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA))
         {
             constexpr bool use_sparse_kernel = false;
             fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>;
 
+#if CUDART_VERSION > 8000 || (!defined(CUDART_VERSION) && !defined(GGML_USE_MUSA))
             static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
             if (!shared_memory_limit_raised[id]) {
                 CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
                 shared_memory_limit_raised[id] = true;
             }
+#endif // CUDART_VERSION > 8000 || (!defined(CUDART_VERSION) && !defined(GGML_USE_MUSA))
         }
     } else {
         constexpr bool use_logit_softcap = true;
         constexpr bool use_sparse_kernel = false;
         fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>;
 
+#if CUDART_VERSION > 8000 || (!defined(CUDART_VERSION) && !defined(GGML_USE_MUSA))
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
         if (!shared_memory_limit_raised[id]) {
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
             shared_memory_limit_raised[id] = true;
         }
+#endif // CUDART_VERSION > 8000 || (!defined(CUDART_VERSION) && !defined(GGML_USE_MUSA))
     }
 
     const bool async_kv_preload = nstages == 2 && !use_sparse;
