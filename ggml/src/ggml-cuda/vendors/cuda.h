@@ -28,6 +28,7 @@
 	#define __bfloat162float __half2float
 	#define __float2bfloat16 __float2half
 	#define __bfloat1622float2 __half22float2
+	#define __float22bfloat162_rn __float22half2_rn
 	#define nv_bfloat16 half
 	#define nv_bfloat162 half2
 	#define CUDA_R_16BF CUDA_R_16F

@@ -877,6 +877,14 @@ static void mul_mat_f_switch_rows_per_block(
     }
 }
 
+// Kepler/CUDA<11 port: without cuda_bf16.h, vendors/cuda.h aliases nv_bfloat162 to half2, so the bf16
+// instantiations would duplicate the half2 ones.
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || CUDART_VERSION >= 11000
+#define DECL_MMF_CASE_BF16(...) __VA_ARGS__
+#else
+#define DECL_MMF_CASE_BF16(...)
+#endif
+
 #define DECL_MMF_CASE_HELPER(T, nrows_dst, ncols_dst) \
     template void mul_mat_f_cuda<T, nrows_dst, ncols_dst>( \
         const T * x, const float * y, const int32_t * ids, float * dst, \
@@ -891,18 +899,18 @@ static void mul_mat_f_switch_rows_per_block(
 #define DECL_MMF_CASE_EXTERN(ncols_dst) \
     extern DECL_MMF_CASE_HELPER(float, MMF_ROWS_PER_BLOCK, ncols_dst) \
     extern DECL_MMF_CASE_HELPER(half2, MMF_ROWS_PER_BLOCK, ncols_dst) \
-    extern DECL_MMF_CASE_HELPER(nv_bfloat162, MMF_ROWS_PER_BLOCK, ncols_dst) \
+    DECL_MMF_CASE_BF16(extern DECL_MMF_CASE_HELPER(nv_bfloat162, MMF_ROWS_PER_BLOCK, ncols_dst)) \
     extern DECL_MMF_CASE_HELPER(float, MMF_ROWS_PER_BLOCK_CDNA, ncols_dst) \
     extern DECL_MMF_CASE_HELPER(half2, MMF_ROWS_PER_BLOCK_CDNA, ncols_dst) \
-    extern DECL_MMF_CASE_HELPER(nv_bfloat162, MMF_ROWS_PER_BLOCK_CDNA, ncols_dst)
+    DECL_MMF_CASE_BF16(extern DECL_MMF_CASE_HELPER(nv_bfloat162, MMF_ROWS_PER_BLOCK_CDNA, ncols_dst))
 
 #define DECL_MMF_CASE(ncols_dst) \
     DECL_MMF_CASE_HELPER(float, MMF_ROWS_PER_BLOCK, ncols_dst) \
     DECL_MMF_CASE_HELPER(half2, MMF_ROWS_PER_BLOCK, ncols_dst) \
-    DECL_MMF_CASE_HELPER(nv_bfloat162, MMF_ROWS_PER_BLOCK, ncols_dst) \
+    DECL_MMF_CASE_BF16(DECL_MMF_CASE_HELPER(nv_bfloat162, MMF_ROWS_PER_BLOCK, ncols_dst)) \
     DECL_MMF_CASE_HELPER(float, MMF_ROWS_PER_BLOCK_CDNA, ncols_dst) \
     DECL_MMF_CASE_HELPER(half2, MMF_ROWS_PER_BLOCK_CDNA, ncols_dst) \
-    DECL_MMF_CASE_HELPER(nv_bfloat162, MMF_ROWS_PER_BLOCK_CDNA, ncols_dst)
+    DECL_MMF_CASE_BF16(DECL_MMF_CASE_HELPER(nv_bfloat162, MMF_ROWS_PER_BLOCK_CDNA, ncols_dst))
 
 DECL_MMF_CASE_EXTERN(1);
 DECL_MMF_CASE_EXTERN(2);
