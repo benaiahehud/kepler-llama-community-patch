@@ -1574,12 +1574,13 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const void * beta = traits::get_beta();
 
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    // unconfirmed patch: FP32 FP16 BF16 priority?
+    // Kepler port: upstream rules, plus f32 output on GPUs without fast fp16 arithmetic (sm_30).
+    // (The community patch had `cc == !fast_fp16_hardware_available(cc)`, always false, and narrowed BF16.)
     bool prefer_f32_output = false;
     if (compute_type == GGML_TYPE_F16) {
-        prefer_f32_output = cc == !fast_fp16_hardware_available(cc) || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
+        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || (GGML_CUDA_CC_IS_NVIDIA(cc) && !fast_fp16_hardware_available(cc)) || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
     } else if (compute_type == GGML_TYPE_BF16) {
-        prefer_f32_output = (GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_AMPERE/*untest*/) || (GGML_CUDA_CC_IS_AMD(cc) && !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc)) || (GGML_CUDA_CC_IS_MTHREADS(cc) && cc < GGML_CUDA_CC_QY2);
+        prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
     }
 
     if (prefer_f32_output) {
