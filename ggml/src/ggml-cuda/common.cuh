@@ -128,9 +128,9 @@
 #endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUDART_VERSION >= 12030 || (!(defined(_MSC_VER) && !defined(__clang__)) && CUDART_VERSION >= 11080))
 
 static __device__ __forceinline__ void ggml_cuda_syncwarp() {
-#ifndef GGML_USE_HIP
+#if !defined(GGML_USE_HIP) && (CUDART_VERSION > 8000 || !defined(CUDART_VERSION))
     __syncwarp();
-#endif // GGML_USE_HIP
+#endif
 }
 
 static __device__ __forceinline__ void ggml_cuda_pdl_sync() {
@@ -240,7 +240,7 @@ static const char * cu_get_error_str(CUresult err) {
 #define CU_CHECK(err) CUDA_CHECK_GEN(err, CUDA_SUCCESS, cu_get_error_str)
 #endif
 
-#if !defined(GGML_USE_HIP)
+#if !defined(GGML_USE_HIP) && (CUDART_VERSION > 8000 || !defined(CUDART_VERSION))
 #    define CUDA_SET_SHARED_MEMORY_LIMIT(kernel, nbytes)                                                       \
         do {                                                                                                   \
             static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = { false };                         \
@@ -255,21 +255,26 @@ static const char * cu_get_error_str(CUresult err) {
         do {                                             \
             GGML_UNUSED(nbytes);                         \
         } while (0)
-#endif // !defined(GGML_USE_HIP)
+#endif // CUDA shared memory limit support
 
-#if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA)
-#define GGML_CUDA_ASSUME(x) __builtin_assume(x)
+#if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(__clang__)
+  #define GGML_CUDA_ASSUME(x) __builtin_assume(x)
+#elif defined(_MSC_VER)
+  #define GGML_CUDA_ASSUME(x) __assume(x)
+#elif defined(__GNUC__)
+  #define GGML_CUDA_ASSUME(x) if (!(x)) __builtin_unreachable();
 #else
-#define GGML_CUDA_ASSUME(x)
-#endif // CUDART_VERSION >= 11010
+  #define GGML_CUDA_ASSUME(x)
+#endif
 
 #if (!defined(GGML_USE_HIP) && !defined(GGML_CUDA_NO_VMM)) || (defined(GGML_USE_HIP) && !defined(GGML_HIP_NO_VMM))
 #define GGML_USE_VMM
 #endif // (!defined(GGML_USE_HIP) && !defined(GGML_CUDA_NO_VMM)) || (defined(GGML_USE_HIP) && !defined(GGML_HIP_NO_VMM))
 
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL || \
+    (CUDART_VERSION >= 7050 && CUDART_VERSION < 11000 && __CUDA_ARCH__ >= GGML_CUDA_CC_MAXWELL3)
 #define FP16_AVAILABLE
-#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL || CUDA 7.5+ Maxwell 3
 
 #if defined(FP16_AVAILABLE) && __CUDA_ARCH__ != 610
 #define FAST_FP16_AVAILABLE
@@ -458,32 +463,45 @@ template<int width = WARP_SIZE>
 static __device__ __forceinline__ int warp_reduce_sum(int x) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
     return __reduce_add_sync(0xffffffff, x);
-#else
+#elif __CUDA_ARCH__ >= GGML_CUDA_CC_KEPLER
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
         x += __shfl_xor_sync(0xffffffff, x, offset, width);
     }
+    return x;
+#else
+    NO_DEVICE_CODE;
     return x;
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 }
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_KEPLER
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
         x += __shfl_xor_sync(0xffffffff, x, offset, width);
     }
     return x;
+#else
+    NO_DEVICE_CODE;
+    return x;
+#endif
 }
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float2 warp_reduce_sum(float2 a) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_KEPLER
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
         a.x += __shfl_xor_sync(0xffffffff, a.x, offset, width);
         a.y += __shfl_xor_sync(0xffffffff, a.y, offset, width);
     }
     return a;
+#else
+    NO_DEVICE_CODE;
+    return a;
+#endif
 }
 
 template<int width = WARP_SIZE>
@@ -506,7 +524,7 @@ static __device__ __forceinline__ int warp_reduce_all(int x) {
     if (width == ggml_cuda_get_physical_warp_size()) {
         return __all_sync(0xffffffff, x);
     } else {
-#if __CUDA_ARCH__ >= GGML_CUDA_CC_KEPELE
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_KEPLER
 #pragma unroll
         for (int offset = width/2; offset > 0; offset >>= 1) {
             x = __shfl_xor_sync(0xffffffff, x, offset, width) && x;
@@ -524,7 +542,7 @@ static __device__ __forceinline__ int warp_reduce_any(int x) {
     if (width == ggml_cuda_get_physical_warp_size()) {
         return __any_sync(0xffffffff, x);
     } else {
-#if __CUDA_ARCH__ >= GGML_CUDA_CC_KEPELE
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_KEPLER
 #pragma unroll
         for (int offset = width/2; offset > 0; offset >>= 1) {
             x = __shfl_xor_sync(0xffffffff, x, offset, width) || x;
@@ -539,7 +557,7 @@ static __device__ __forceinline__ int warp_reduce_any(int x) {
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_max(float x) {
-#if __CUDA_ARCH__ >= GGML_CUDA_CC_KEPELE
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_KEPLER
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
         x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, offset, width));
@@ -553,7 +571,7 @@ static __device__ __forceinline__ float warp_reduce_max(float x) {
 
 template<typename T, int width = WARP_SIZE>
 static __device__ __forceinline__ T warp_prefix_inclusive_sum(T x) {
-#if __CUDA_ARCH__ >= GGML_CUDA_CC_KEPELE
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_KEPLER
     const int lane_id = threadIdx.x % width;
 #pragma unroll
     for (int offset = 1; offset < width; offset <<= 1) {
@@ -571,7 +589,7 @@ static __device__ __forceinline__ T warp_prefix_inclusive_sum(T x) {
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float2 warp_prefix_inclusive_sum(float2 a) {
-#if __CUDA_ARCH__ >= GGML_CUDA_CC_KEPELE
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_KEPLER
     const int lane_id = threadIdx.x % width;
 #pragma unroll
     for (int offset = 1; offset < width; offset <<= 1) {
@@ -711,20 +729,32 @@ static __device__ __forceinline__ half2 ggml_cuda_hmax2(const half2 a, const hal
 #elif CUDART_VERSION >= CUDART_HMAX
     return __hmax2(a, b);
 #else
+#if CUDART_VERSION < 11000
+    return make_half2(
+        fmaxf( __low2float(a),  __low2float(b)),
+        fmaxf(__high2float(a), __high2float(b))
+    );
+#else
     half2 ret;
     reinterpret_cast<half&>(ret.x) = __float2half(fmaxf( __low2float(a),  __low2float(b)));
     reinterpret_cast<half&>(ret.y) = __float2half(fmaxf(__high2float(a), __high2float(b)));
     return ret;
 #endif
+#endif
 }
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ half2 warp_reduce_max(half2 x) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_KEPLER || defined(GGML_USE_HIP)
 #pragma unroll
    for (int offset = width/2; offset > 0; offset >>= 1) {
        x = ggml_cuda_hmax2(x, __shfl_xor_sync(0xffffffff, x, offset, width));
    }
    return x;
+#else
+    NO_DEVICE_CODE;
+    return x;
+#endif
 }
 
 #if (defined(CUDART_VERSION) && CUDART_VERSION < CUDART_HMASK) || defined(GGML_USE_HIP) || \
