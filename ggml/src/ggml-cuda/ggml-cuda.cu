@@ -1609,7 +1609,45 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     // Theoretically cublasGemmStridedBatchedEx would always work, even for a single matrix.
     // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
     //     probably because the internal kernel selection logic is suboptimal.
-    if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
+    // Kepler port: cuBLAS rejects the *Ex GEMMs below cc 5.0 (CUBLAS_STATUS_ARCH_MISMATCH, measured on
+    // a GTX 650 Ti with cuBLAS 10.2). ggml_cuda_mul_mat_cublas forces F32 compute there; use the classic
+    // single-precision batched entry points instead of GemmStridedBatchedEx / GemmBatchedEx.
+    const bool legacy_sgemm = compute_type == GGML_TYPE_F32 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc < 500;
+    if (legacy_sgemm && !(ne12 == 1 && ne13 == 1) && r2 == 1 && r3 == 1 && is_src0_cont_2 && is_src1_cont_2) {
+        const int64_t sma = ne02 == 1 ? s03 : s02;
+        const int64_t smb = ne12 == 1 ? s13 : s12;
+        CUBLAS_CHECK(
+        cublasSgemmStridedBatched(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                ne01, ne11, ne10,
+                (const float *) alpha, (const float *) src0_ptr, s01, sma,
+                                       (const float *) src1_ptr, s11, smb,
+                (const float *) beta,  (float       *)  dst_ptr, ldc, ne1*ldc,
+                ne12*ne13));
+    } else if (legacy_sgemm && !(ne12 == 1 && ne13 == 1)) {
+        const int64_t ne23 = ne12*ne13;
+        ggml_cuda_pool_alloc<const void *> ptrs_src(ctx.pool(), 2*ne23);
+        ggml_cuda_pool_alloc<      void *> ptrs_dst(ctx.pool(), 1*ne23);
+        const size_t src_type_size = sizeof(cuda_t);
+        const dim3 block_dims(16, 16);
+        const dim3 grid_dims((ne13 + 15) / 16, (ne12 + 15) / 16);
+        k_compute_batched_ptrs<<<grid_dims, block_dims, 0, main_stream>>>(
+                src0_ptr, src1_ptr, dst_ptr,
+                ptrs_src.get(), ptrs_dst.get(),
+                ne12, ne13,
+                ne23,
+                s02*src_type_size, s03*src_type_size,
+                s12*src_type_size, s13*src_type_size,
+                nbd2, nbd3,
+                r2, r3);
+        CUDA_CHECK(cudaGetLastError());
+        CUBLAS_CHECK(
+        cublasSgemmBatched(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                ne01, ne11, ne10,
+                (const float *) alpha, (const float **) (ptrs_src.get() + 0*ne23), s01,
+                                       (const float **) (ptrs_src.get() + 1*ne23), s11,
+                (const float *) beta,  (      float **) (ptrs_dst.get() + 0*ne23), ldc,
+                ne23));
+    } else if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
         CUBLAS_CHECK(
             cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                     ne01, ne11, ne10,
@@ -1726,6 +1764,11 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         } else if (env_cpp != "auto") {
             GGML_LOG_WARN("%s: unknown value for GGML_CUDA_CUBLAS_COMPUTE_TYPE: %s", __func__, env_cpp.c_str());
         }
+    }
+
+    // Kepler port: only the classic FP32 cuBLAS GEMMs run below cc 5.0 (see ggml_cuda_mul_mat_cublas_impl).
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc < 500) {
+        compute_type = GGML_TYPE_F32;
     }
 
     constexpr size_t max_src0_convert_size = 512ull * 1024 * 1024;
@@ -5664,6 +5707,19 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 // TODO: move these functions here
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(CUDART_VERSION) && CUDART_VERSION < 11000
+    // Kepler port: without cuda_bf16.h, vendors/cuda.h aliases nv_bfloat16 to half, which would read
+    // real BF16 data as FP16. Decline every BF16 op so the scheduler runs it on another backend.
+    if (op->type == GGML_TYPE_BF16) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (op->src[i] && op->src[i]->type == GGML_TYPE_BF16) {
+            return false;
+        }
+    }
+#endif
 
     // check if all the sources are allocated on this device
     for (int i = 0; i < GGML_MAX_SRC; i++) {
