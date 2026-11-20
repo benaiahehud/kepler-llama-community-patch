@@ -107,11 +107,25 @@ static __device__ __forceinline__ float op_ceil(float x) {
 }
 
 static __device__ __forceinline__ float op_round(float x) {
+    #ifdef __NVCC__
     return roundf(x);
+    #else
+    if (isnan(x) || isinf(x)) {
+        return x;
+    }
+    return copysignf(floorf(fabsf(x) + 0.5f), x);
+    #endif
 }
 
 static __device__ __forceinline__ float op_trunc(float x) {
+    #ifdef __NVCC__
     return trunc(x);
+    #else
+    if (isnan(x) || isinf(x)) {
+        return x;
+    }
+    return (x < 0.0f) ? ceilf(x) : floorf(x);
+    #endif
 }
 
 template <float (*op)(float), typename T>
