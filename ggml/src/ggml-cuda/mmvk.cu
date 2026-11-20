@@ -5,16 +5,6 @@
 #include <cstdlib>
 #include <cstring>
 
-// Tunable launch geometry for Kepler (sm_30).
-// THREADS_PER_ROW must be a power of 2 <= WARP_SIZE so reduction uses warp shuffles only.
-static constexpr int MMVK_Q4_K_THREADS_PER_ROW = 32; // must be multiple of 8 (8 threads per super-block)
-static constexpr int MMVK_Q4_K_ROWS_PER_GROUP  = 2;
-static constexpr int MMVK_Q4_K_WARPS_PER_BLOCK = 4;
-
-static constexpr int MMVK_Q6_K_THREADS_PER_ROW = 32; // must be multiple of 16 (16 threads per super-block)
-static constexpr int MMVK_Q6_K_ROWS_PER_GROUP  = 2;
-static constexpr int MMVK_Q6_K_WARPS_PER_BLOCK = 4;
-
 static_assert(sizeof(block_q4_K) == 144, "unexpected block_q4_K size");
 static_assert(offsetof(block_q4_K, scales) == 4, "unexpected block_q4_K scales offset");
 static_assert(offsetof(block_q4_K, qs) == 16, "unexpected block_q4_K qs offset");
@@ -27,35 +17,124 @@ static_assert(offsetof(block_q6_K, d) == 208, "unexpected block_q6_K d offset");
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
-static constexpr __host__ __device__ int mmvk_min_blocks_per_sm(int warps_per_block) {
-    // 1024 threads/SMX caps register target at 63/thread on sm_30 without forcing spills.
-    return (1024 / (warps_per_block * WARP_SIZE)) > 0 ? (1024 / (warps_per_block * WARP_SIZE)) : 1;
+// Selectable Kepler (sm_30) launch geometries "<THREADS_PER_ROW>x<ROWS_PER_GROUP>x<WARPS_PER_BLOCK>":
+// - GGML_CUDA_KEPLER_MMV_Q4K: "32x1x4" (default), "32x1x8", "32x2x4", "8x1x4"
+// - GGML_CUDA_KEPLER_MMV_Q6K: "32x2x4" (default), "32x1x4", "32x1x8", "16x1x4"
+enum mmvk_q4_k_variant {
+    MMVK_Q4_K_32x1x4 = 0,
+    MMVK_Q4_K_32x1x8,
+    MMVK_Q4_K_32x2x4,
+    MMVK_Q4_K_8x1x4,
+};
+
+enum mmvk_q6_k_variant {
+    MMVK_Q6_K_32x2x4 = 0,
+    MMVK_Q6_K_32x1x4,
+    MMVK_Q6_K_32x1x8,
+    MMVK_Q6_K_16x1x4,
+};
+
+static mmvk_q4_k_variant ggml_cuda_kepler_mmv_q4k_variant() {
+    static const mmvk_q4_k_variant variant = []() {
+        const char * env = std::getenv("GGML_CUDA_KEPLER_MMV_Q4K");
+        if (env == nullptr || env[0] == '\0') {
+            return MMVK_Q4_K_32x1x4;
+        }
+        if (std::strcmp(env, "32x1x4") == 0) {
+            return MMVK_Q4_K_32x1x4;
+        }
+        if (std::strcmp(env, "32x1x8") == 0) {
+            return MMVK_Q4_K_32x1x8;
+        }
+        if (std::strcmp(env, "32x2x4") == 0) {
+            return MMVK_Q4_K_32x2x4;
+        }
+        if (std::strcmp(env, "8x1x4") == 0) {
+            return MMVK_Q4_K_8x1x4;
+        }
+        return MMVK_Q4_K_32x1x4;
+    }();
+    return variant;
 }
 
-static __device__ __forceinline__ void q4_k_dot8_bias(
-        const uint32_t u, const float4 y_lo, const float4 y_hi,
-        float & sum_q0, float & sum_q1) {
-    // One shift extracts the upper 16 bits for all 8 weights.
-    // Exponents 0x4B/0x47 place bits 0..3 / 8..11 at integer scale; 0x49/0x45 fold the 1/16 of high nibbles.
+static mmvk_q6_k_variant ggml_cuda_kepler_mmv_q6k_variant() {
+    static const mmvk_q6_k_variant variant = []() {
+        const char * env = std::getenv("GGML_CUDA_KEPLER_MMV_Q6K");
+        if (env == nullptr || env[0] == '\0') {
+            return MMVK_Q6_K_32x2x4;
+        }
+        if (std::strcmp(env, "32x2x4") == 0) {
+            return MMVK_Q6_K_32x2x4;
+        }
+        if (std::strcmp(env, "32x1x4") == 0) {
+            return MMVK_Q6_K_32x1x4;
+        }
+        if (std::strcmp(env, "32x1x8") == 0) {
+            return MMVK_Q6_K_32x1x8;
+        }
+        if (std::strcmp(env, "16x1x4") == 0) {
+            return MMVK_Q6_K_16x1x4;
+        }
+        return MMVK_Q6_K_32x2x4;
+    }();
+    return variant;
+}
+
+static __device__ __forceinline__ float q4_k_dot4_lo_bias(
+        const uint32_t u, const float4 y, float sum) {
+    // Exponents 0x4B/0x47 place low nibbles (bits 0..3 and 8..11) at integer scale without I2F.
     const uint32_t u_hi = u >> 16;
+    sum = fmaf(__fadd_rn(__uint_as_float((u    & 0x000Fu) | 0x4B000000u), -8388608.0f), y.x, sum);
+    sum = fmaf(__fadd_rn(__uint_as_float((u    & 0x0F00u) | 0x47000000u), -32768.0f),   y.y, sum);
+    sum = fmaf(__fadd_rn(__uint_as_float((u_hi & 0x000Fu) | 0x4B000000u), -8388608.0f), y.z, sum);
+    sum = fmaf(__fadd_rn(__uint_as_float((u_hi & 0x0F00u) | 0x47000000u), -32768.0f),   y.w, sum);
+    return sum;
+}
 
-    const float ql0 = __fadd_rn(__uint_as_float((u    & 0x000Fu) | 0x4B000000u), -8388608.0f);
-    const float ql1 = __fadd_rn(__uint_as_float((u    & 0x0F00u) | 0x47000000u), -32768.0f);
-    const float ql2 = __fadd_rn(__uint_as_float((u_hi & 0x000Fu) | 0x4B000000u), -8388608.0f);
-    const float ql3 = __fadd_rn(__uint_as_float((u_hi & 0x0F00u) | 0x47000000u), -32768.0f);
+static __device__ __forceinline__ float q4_k_dot4_hi_bias(
+        const uint32_t u, const float4 y, float sum) {
+    // Exponents 0x49/0x45 fold the 1/16 shift of high nibbles (bits 4..7 and 12..15) directly.
+    const uint32_t u_hi = u >> 16;
+    sum = fmaf(__fadd_rn(__uint_as_float((u    & 0x00F0u) | 0x49000000u), -524288.0f), y.x, sum);
+    sum = fmaf(__fadd_rn(__uint_as_float((u    & 0xF000u) | 0x45000000u), -2048.0f),   y.y, sum);
+    sum = fmaf(__fadd_rn(__uint_as_float((u_hi & 0x00F0u) | 0x49000000u), -524288.0f), y.z, sum);
+    sum = fmaf(__fadd_rn(__uint_as_float((u_hi & 0xF000u) | 0x45000000u), -2048.0f),   y.w, sum);
+    return sum;
+}
 
-    sum_q0 = fmaf(ql0, y_lo.x, fmaf(ql1, y_lo.y, fmaf(ql2, y_lo.z, fmaf(ql3, y_lo.w, sum_q0))));
+static __device__ __forceinline__ float q4_k_apply_hdr(
+        const uint4 hdr, const uint32_t sc_shift, const uint32_t hi_mask,
+        const float sum_q0, const float sum_q1,
+        const float sum_y0, const float sum_y1,
+        float acc) {
+    half2 dm_h2;
+    memcpy(&dm_h2, &hdr.x, sizeof(dm_h2));
+    const float2 dm = __half22float2(dm_h2);
 
-    const float qh0 = __fadd_rn(__uint_as_float((u    & 0x00F0u) | 0x49000000u), -524288.0f);
-    const float qh1 = __fadd_rn(__uint_as_float((u    & 0xF000u) | 0x45000000u), -2048.0f);
-    const float qh2 = __fadd_rn(__uint_as_float((u_hi & 0x00F0u) | 0x49000000u), -524288.0f);
-    const float qh3 = __fadd_rn(__uint_as_float((u_hi & 0xF000u) | 0x45000000u), -2048.0f);
+    const uint32_t s0_16 = hdr.y >> sc_shift;
+    const uint32_t s1_16 = hdr.z >> sc_shift;
+    const uint32_t s2_16 = hdr.w >> sc_shift;
 
-    sum_q1 = fmaf(qh0, y_hi.x, fmaf(qh1, y_hi.y, fmaf(qh2, y_hi.z, fmaf(qh3, y_hi.w, sum_q1))));
+    const uint32_t sc_lo   = s0_16 & 0x3F3Fu;
+    const uint32_t m_lo    = s1_16 & 0x3F3Fu;
+    const uint32_t sc_hi   = (s2_16 & 0x0F0Fu) | ((s0_16 & 0xC0C0u) >> 2);
+    const uint32_t m_hi    = ((s2_16 >> 4) & 0x0F0Fu) | ((s1_16 & 0xC0C0u) >> 2);
+    const uint32_t sc_pair = (sc_lo & ~hi_mask) | (sc_hi & hi_mask);
+    const uint32_t m_pair  = (m_lo  & ~hi_mask) | (m_hi  & hi_mask);
+
+    // Decode one sub-block's scale and min at a time to keep register pressure low.
+    const float sc0 = __fadd_rn(__uint_as_float((sc_pair & 0x003Fu) | 0x4B000000u), -8388608.0f);
+    const float m0  = __fadd_rn(__uint_as_float((m_pair  & 0x003Fu) | 0x4B000000u), -8388608.0f);
+    acc = fmaf(dm.x * sc0, sum_q0, fmaf(-(dm.y * m0), sum_y0, acc));
+
+    const float sc1 = __fadd_rn(__uint_as_float((sc_pair & 0x3F00u) | 0x47000000u), -32768.0f);
+    const float m1  = __fadd_rn(__uint_as_float((m_pair  & 0x3F00u) | 0x47000000u), -32768.0f);
+    acc = fmaf(dm.x * sc1, sum_q1, fmaf(-(dm.y * m1), sum_y1, acc));
+    return acc;
 }
 
 template <int THREADS_PER_ROW, int ROWS_PER_GROUP, int WARPS_PER_BLOCK>
-__launch_bounds__(WARPS_PER_BLOCK * WARP_SIZE, mmvk_min_blocks_per_sm(WARPS_PER_BLOCK))
+__launch_bounds__(WARPS_PER_BLOCK * WARP_SIZE)
 static __global__ void mul_mat_vec_q4_K_kepler(
         const block_q4_K * __restrict__ vx,
         const float * __restrict__ vy,
@@ -73,31 +152,28 @@ static __global__ void mul_mat_vec_q4_K_kepler(
         const int64_t stride_sample_dst) {
     static_assert(THREADS_PER_ROW >= 8 && THREADS_PER_ROW <= WARP_SIZE && (THREADS_PER_ROW & (THREADS_PER_ROW - 1)) == 0,
                   "THREADS_PER_ROW must be power of 2 in [8, 32]");
+    static_assert(ROWS_PER_GROUP >= 1, "ROWS_PER_GROUP must be >= 1");
 
     constexpr int GROUPS_PER_WARP  = WARP_SIZE / THREADS_PER_ROW;
     constexpr int GROUPS_PER_BLOCK = WARPS_PER_BLOCK * GROUPS_PER_WARP;
     constexpr int ROWS_PER_BLOCK   = GROUPS_PER_BLOCK * ROWS_PER_GROUP;
     constexpr int BLOCKS_PER_ITER  = THREADS_PER_ROW / 8;
 
+    const int warp_row0 = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y * GROUPS_PER_WARP * ROWS_PER_GROUP;
+    if (warp_row0 >= nrows) {
+        return;
+    }
+
     const int lane          = threadIdx.x;
     const int group_in_warp = lane / THREADS_PER_ROW;
     const int lane_in_group = lane % THREADS_PER_ROW;
-    const int group_id      = threadIdx.y * GROUPS_PER_WARP + group_in_warp;
-    const int row0          = blockIdx.x * ROWS_PER_BLOCK + group_id * ROWS_PER_GROUP;
+    const int row0          = warp_row0 + group_in_warp * ROWS_PER_GROUP;
 
-    if constexpr (GROUPS_PER_WARP == 1) {
-        if (row0 >= nrows) {
-            return;
-        }
-    }
-
-    const uint32_t channel_dst = blockIdx.y;
-    const uint32_t sample_dst  = blockIdx.z;
-    const uint32_t channel_x   = fastdiv(channel_dst, channel_ratio);
-    const uint32_t sample_x    = fastdiv(sample_dst,  sample_ratio);
+    const uint32_t channel_x = fastdiv(blockIdx.y, channel_ratio);
+    const uint32_t sample_x  = fastdiv(blockIdx.z, sample_ratio);
 
     const block_q4_K * x_base = vx + sample_x * stride_sample_x + channel_x * stride_channel_x;
-    const float      * y_base = vy + sample_dst * stride_sample_y + channel_dst * stride_channel_y;
+    const float      * y_base = vy + blockIdx.z * stride_sample_y + blockIdx.y * stride_channel_y;
 
     // 8 threads cooperate per block_q4_K: each loads one uint4 (16 bytes = 32 weights) of qs.
     const int blk_in_group = lane_in_group >> 3;
@@ -108,126 +184,153 @@ static __global__ void mul_mat_vec_q4_K_kepler(
     const uint32_t sc_shift = static_cast<uint32_t>((chunk & 1) << 4);
     const uint32_t hi_mask  = static_cast<uint32_t>(-static_cast<int32_t>(chunk >= 2));
 
-    const int y4_off_lo = 16 * chunk + 4 * half_chunk;
-    const int y4_off_hi = y4_off_lo + 8;
-
-    const block_q4_K * row_ptrs[ROWS_PER_GROUP];
-#pragma unroll
-    for (int r = 0; r < ROWS_PER_GROUP; ++r) {
-        const int row = (row0 + r < nrows) ? (row0 + r) : 0;
-        row_ptrs[r] = x_base + row * stride_row_x + blk_in_group;
-    }
-
-    const float4 * y4 = reinterpret_cast<const float4 *>(y_base + static_cast<int64_t>(blk_in_group) * QK_K);
-
     float acc[ROWS_PER_GROUP];
 #pragma unroll
     for (int r = 0; r < ROWS_PER_GROUP; ++r) {
         acc[r] = 0.0f;
     }
 
-    for (int ib = blk_in_group; ib < nb; ib += BLOCKS_PER_ITER) {
-        uint4 qs_v[ROWS_PER_GROUP];
+    if (blk_in_group < nb) {
+        const block_q4_K * row_ptrs[ROWS_PER_GROUP];
 #pragma unroll
         for (int r = 0; r < ROWS_PER_GROUP; ++r) {
-            qs_v[r] = reinterpret_cast<const uint4 *>(row_ptrs[r]->qs)[sub];
+            const int row = (row0 + r < nrows) ? (row0 + r) : 0;
+            row_ptrs[r] = x_base + row * stride_row_x + blk_in_group;
         }
 
-        float sum_q0[ROWS_PER_GROUP];
-        float sum_q1[ROWS_PER_GROUP];
-#pragma unroll
-        for (int r = 0; r < ROWS_PER_GROUP; ++r) {
-            sum_q0[r] = 0.0f;
-            sum_q1[r] = 0.0f;
-        }
+        const float4 * y4_lo = reinterpret_cast<const float4 *>(
+            y_base + static_cast<int64_t>(blk_in_group) * QK_K + 64 * chunk + 16 * half_chunk);
 
-        float sum_y0 = 0.0f;
-        float sum_y1 = 0.0f;
-
-        {
-            const float4 y_lo = y4[y4_off_lo + 0];
-            const float4 y_hi = y4[y4_off_hi + 0];
-            sum_y0 += (y_lo.x + y_lo.y) + (y_lo.z + y_lo.w);
-            sum_y1 += (y_hi.x + y_hi.y) + (y_hi.z + y_hi.w);
+        for (int ib = blk_in_group; ; ) {
+            uint4 qs_v[ROWS_PER_GROUP];
 #pragma unroll
             for (int r = 0; r < ROWS_PER_GROUP; ++r) {
-                q4_k_dot8_bias(qs_v[r].x, y_lo, y_hi, sum_q0[r], sum_q1[r]);
+                qs_v[r] = reinterpret_cast<const uint4 *>(row_ptrs[r]->qs)[sub];
             }
-        }
-        {
-            const float4 y_lo = y4[y4_off_lo + 1];
-            const float4 y_hi = y4[y4_off_hi + 1];
-            sum_y0 += (y_lo.x + y_lo.y) + (y_lo.z + y_lo.w);
-            sum_y1 += (y_hi.x + y_hi.y) + (y_hi.z + y_hi.w);
+
+            [[maybe_unused]] uint4 hdr0 = make_uint4(0u, 0u, 0u, 0u);
+            if constexpr (ROWS_PER_GROUP == 1) {
+                // Issue header load alongside qs_v to hide L2/DRAM latency behind dot products.
+                hdr0 = *reinterpret_cast<const uint4 *>(row_ptrs[0]);
+            }
+
+            float sum_q0[ROWS_PER_GROUP];
+            float sum_q1[ROWS_PER_GROUP];
 #pragma unroll
             for (int r = 0; r < ROWS_PER_GROUP; ++r) {
-                q4_k_dot8_bias(qs_v[r].y, y_lo, y_hi, sum_q0[r], sum_q1[r]);
+                sum_q0[r] = 0.0f;
+                sum_q1[r] = 0.0f;
             }
-        }
-        {
-            const float4 y_lo = y4[y4_off_lo + 2];
-            const float4 y_hi = y4[y4_off_hi + 2];
-            sum_y0 += (y_lo.x + y_lo.y) + (y_lo.z + y_lo.w);
-            sum_y1 += (y_hi.x + y_hi.y) + (y_hi.z + y_hi.w);
+
+            float sum_y0 = 0.0f;
+            float sum_y1 = 0.0f;
+
+            // Stream one float4 of y at a time (y_lo then y_hi) per 8 weights.
+            {
+                const float4 y_lo = y4_lo[0];
+                sum_y0 += (y_lo.x + y_lo.y) + (y_lo.z + y_lo.w);
+#pragma unroll
+                for (int r = 0; r < ROWS_PER_GROUP; ++r) {
+                    sum_q0[r] = q4_k_dot4_lo_bias(qs_v[r].x, y_lo, sum_q0[r]);
+                }
+            }
+            {
+                const float4 y_hi = y4_lo[8];
+                sum_y1 += (y_hi.x + y_hi.y) + (y_hi.z + y_hi.w);
+#pragma unroll
+                for (int r = 0; r < ROWS_PER_GROUP; ++r) {
+                    sum_q1[r] = q4_k_dot4_hi_bias(qs_v[r].x, y_hi, sum_q1[r]);
+                }
+            }
+            {
+                const float4 y_lo = y4_lo[1];
+                sum_y0 += (y_lo.x + y_lo.y) + (y_lo.z + y_lo.w);
+#pragma unroll
+                for (int r = 0; r < ROWS_PER_GROUP; ++r) {
+                    sum_q0[r] = q4_k_dot4_lo_bias(qs_v[r].y, y_lo, sum_q0[r]);
+                }
+            }
+            {
+                const float4 y_hi = y4_lo[9];
+                sum_y1 += (y_hi.x + y_hi.y) + (y_hi.z + y_hi.w);
+#pragma unroll
+                for (int r = 0; r < ROWS_PER_GROUP; ++r) {
+                    sum_q1[r] = q4_k_dot4_hi_bias(qs_v[r].y, y_hi, sum_q1[r]);
+                }
+            }
+            {
+                const float4 y_lo = y4_lo[2];
+                sum_y0 += (y_lo.x + y_lo.y) + (y_lo.z + y_lo.w);
+#pragma unroll
+                for (int r = 0; r < ROWS_PER_GROUP; ++r) {
+                    sum_q0[r] = q4_k_dot4_lo_bias(qs_v[r].z, y_lo, sum_q0[r]);
+                }
+            }
+            {
+                const float4 y_hi = y4_lo[10];
+                sum_y1 += (y_hi.x + y_hi.y) + (y_hi.z + y_hi.w);
+#pragma unroll
+                for (int r = 0; r < ROWS_PER_GROUP; ++r) {
+                    sum_q1[r] = q4_k_dot4_hi_bias(qs_v[r].z, y_hi, sum_q1[r]);
+                }
+            }
+            if constexpr (ROWS_PER_GROUP == 2) {
+                // 6 of 8 qs_v regs are dead; prefetch row 0 header behind word 3 dot products.
+                hdr0 = *reinterpret_cast<const uint4 *>(row_ptrs[0]);
+            }
+            {
+                const float4 y_lo = y4_lo[3];
+                sum_y0 += (y_lo.x + y_lo.y) + (y_lo.z + y_lo.w);
+#pragma unroll
+                for (int r = 0; r < ROWS_PER_GROUP; ++r) {
+                    sum_q0[r] = q4_k_dot4_lo_bias(qs_v[r].w, y_lo, sum_q0[r]);
+                }
+            }
+            {
+                const float4 y_hi = y4_lo[11];
+                sum_y1 += (y_hi.x + y_hi.y) + (y_hi.z + y_hi.w);
+#pragma unroll
+                for (int r = 0; r < ROWS_PER_GROUP; ++r) {
+                    sum_q1[r] = q4_k_dot4_hi_bias(qs_v[r].w, y_hi, sum_q1[r]);
+                }
+            }
+
+            if constexpr (ROWS_PER_GROUP == 1) {
+                acc[0] = q4_k_apply_hdr(hdr0, sc_shift, hi_mask, sum_q0[0], sum_q1[0], sum_y0, sum_y1, acc[0]);
+            } else if constexpr (ROWS_PER_GROUP == 2) {
+                const uint4 hdr1 = *reinterpret_cast<const uint4 *>(row_ptrs[1]);
+                acc[0] = q4_k_apply_hdr(hdr0, sc_shift, hi_mask, sum_q0[0], sum_q1[0], sum_y0, sum_y1, acc[0]);
+                acc[1] = q4_k_apply_hdr(hdr1, sc_shift, hi_mask, sum_q0[1], sum_q1[1], sum_y0, sum_y1, acc[1]);
+            } else {
+#pragma unroll
+                for (int r = 0; r < ROWS_PER_GROUP; ++r) {
+                    const uint4 hdr = *reinterpret_cast<const uint4 *>(row_ptrs[r]);
+                    acc[r] = q4_k_apply_hdr(hdr, sc_shift, hi_mask, sum_q0[r], sum_q1[r], sum_y0, sum_y1, acc[r]);
+                }
+            }
+
+            ib += BLOCKS_PER_ITER;
+            if (ib >= nb) {
+                break;
+            }
 #pragma unroll
             for (int r = 0; r < ROWS_PER_GROUP; ++r) {
-                q4_k_dot8_bias(qs_v[r].z, y_lo, y_hi, sum_q0[r], sum_q1[r]);
+                row_ptrs[r] += BLOCKS_PER_ITER;
             }
+            y4_lo += BLOCKS_PER_ITER * (QK_K / 4);
         }
-        {
-            const float4 y_lo = y4[y4_off_lo + 3];
-            const float4 y_hi = y4[y4_off_hi + 3];
-            sum_y0 += (y_lo.x + y_lo.y) + (y_lo.z + y_lo.w);
-            sum_y1 += (y_hi.x + y_hi.y) + (y_hi.z + y_hi.w);
-#pragma unroll
-            for (int r = 0; r < ROWS_PER_GROUP; ++r) {
-                q4_k_dot8_bias(qs_v[r].w, y_lo, y_hi, sum_q0[r], sum_q1[r]);
-            }
-        }
-
-#pragma unroll
-        for (int r = 0; r < ROWS_PER_GROUP; ++r) {
-            const uint4 hdr = *reinterpret_cast<const uint4 *>(row_ptrs[r]);
-
-            half2 dm_h2;
-            memcpy(&dm_h2, &hdr.x, sizeof(dm_h2));
-            const float2 dm = __half22float2(dm_h2);
-
-            const uint32_t s0_16 = hdr.y >> sc_shift;
-            const uint32_t s1_16 = hdr.z >> sc_shift;
-            const uint32_t s2_16 = hdr.w >> sc_shift;
-
-            const uint32_t sc_lo   = s0_16 & 0x3F3Fu;
-            const uint32_t m_lo    = s1_16 & 0x3F3Fu;
-            const uint32_t sc_hi   = (s2_16 & 0x0F0Fu) | ((s0_16 & 0xC0C0u) >> 2);
-            const uint32_t m_hi    = ((s2_16 >> 4) & 0x0F0Fu) | ((s1_16 & 0xC0C0u) >> 2);
-            const uint32_t sc_pair = (sc_lo & ~hi_mask) | (sc_hi & hi_mask);
-            const uint32_t m_pair  = (m_lo  & ~hi_mask) | (m_hi  & hi_mask);
-
-            const float sc0 = __fadd_rn(__uint_as_float((sc_pair & 0x003Fu) | 0x4B000000u), -8388608.0f);
-            const float sc1 = __fadd_rn(__uint_as_float((sc_pair & 0x3F00u) | 0x47000000u), -32768.0f);
-            const float m0  = __fadd_rn(__uint_as_float((m_pair  & 0x003Fu) | 0x4B000000u), -8388608.0f);
-            const float m1  = __fadd_rn(__uint_as_float((m_pair  & 0x3F00u) | 0x47000000u), -32768.0f);
-
-            const float d0   = dm.x * sc0;
-            const float d1   = dm.x * sc1;
-            const float min0 = dm.y * m0;
-            const float min1 = dm.y * m1;
-
-            acc[r] = fmaf(d0, sum_q0[r], fmaf(-min0, sum_y0, acc[r]));
-            acc[r] = fmaf(d1, sum_q1[r], fmaf(-min1, sum_y1, acc[r]));
-
-            row_ptrs[r] += BLOCKS_PER_ITER;
-        }
-        y4 += BLOCKS_PER_ITER * (QK_K / 4);
     }
 
-    float * dst_base = dst + sample_dst * stride_sample_dst + channel_dst * stride_channel_dst;
+    // Recompute output indices after the loop so they do not occupy registers during K-loop.
+    const int lane_out = threadIdx.x;
+    const int row0_out = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.y * GROUPS_PER_WARP + lane_out / THREADS_PER_ROW) * ROWS_PER_GROUP;
+    const int lig_out  = lane_out % THREADS_PER_ROW;
+    float * dst_base   = dst + blockIdx.z * stride_sample_dst + blockIdx.y * stride_channel_dst;
 #pragma unroll
     for (int r = 0; r < ROWS_PER_GROUP; ++r) {
         const float sum = warp_reduce_sum<THREADS_PER_ROW>(acc[r]);
-        if (lane_in_group == 0 && row0 + r < nrows) {
-            dst_base[row0 + r] = sum;
+        if (lig_out == 0 && row0_out + r < nrows) {
+            dst_base[row0_out + r] = sum;
         }
     }
 }
@@ -235,11 +338,11 @@ static __global__ void mul_mat_vec_q4_K_kepler(
 static __device__ __forceinline__ float dot4_u6_bias(const uint32_t q, const float4 y) {
     // q holds 4 unsigned 6-bit quants in bytes 0..3 (bits 6..7 of each byte are 0).
     // Bias subtraction also folds the -32 zero-point.
-    const float f0 = __fadd_rn(__uint_as_float((q & 0x0000003Fu) | 0x4B000000u), -8388640.0f);
-    const float f1 = __fadd_rn(__uint_as_float((q & 0x00003F00u) | 0x47000000u), -32800.0f);
-    const float f2 = __fadd_rn(__uint_as_float((q & 0x003F0000u) | 0x43000000u), -160.0f);
-    const float f3 = __fadd_rn(__uint_as_float((q >> 24)         | 0x4B000000u), -8388640.0f);
-    return fmaf(f0, y.x, fmaf(f1, y.y, fmaf(f2, y.z, f3 * y.w)));
+    float sum = __fadd_rn(__uint_as_float((q >> 24)         | 0x4B000000u), -8388640.0f) * y.w;
+    sum = fmaf(__fadd_rn(__uint_as_float((q & 0x003F0000u) | 0x43000000u), -160.0f),     y.z, sum);
+    sum = fmaf(__fadd_rn(__uint_as_float((q & 0x00003F00u) | 0x47000000u), -32800.0f),   y.y, sum);
+    sum = fmaf(__fadd_rn(__uint_as_float((q & 0x0000003Fu) | 0x4B000000u), -8388640.0f), y.x, sum);
+    return sum;
 }
 
 static __device__ __forceinline__ float i8_to_f32_bias(const int8_t v) {
@@ -261,7 +364,7 @@ static __device__ __forceinline__ uint32_t load_u32_q6_k(
 }
 
 template <int THREADS_PER_ROW, int ROWS_PER_GROUP, int WARPS_PER_BLOCK>
-__launch_bounds__(WARPS_PER_BLOCK * WARP_SIZE, mmvk_min_blocks_per_sm(WARPS_PER_BLOCK))
+__launch_bounds__(WARPS_PER_BLOCK * WARP_SIZE)
 static __global__ void mul_mat_vec_q6_K_kepler(
         const block_q6_K * __restrict__ vx,
         const float * __restrict__ vy,
@@ -279,31 +382,28 @@ static __global__ void mul_mat_vec_q6_K_kepler(
         const int64_t stride_sample_dst) {
     static_assert(THREADS_PER_ROW >= 16 && THREADS_PER_ROW <= WARP_SIZE && (THREADS_PER_ROW & (THREADS_PER_ROW - 1)) == 0,
                   "THREADS_PER_ROW must be power of 2 in [16, 32]");
+    static_assert(ROWS_PER_GROUP >= 1, "ROWS_PER_GROUP must be >= 1");
 
     constexpr int GROUPS_PER_WARP  = WARP_SIZE / THREADS_PER_ROW;
     constexpr int GROUPS_PER_BLOCK = WARPS_PER_BLOCK * GROUPS_PER_WARP;
     constexpr int ROWS_PER_BLOCK   = GROUPS_PER_BLOCK * ROWS_PER_GROUP;
     constexpr int BLOCKS_PER_ITER  = THREADS_PER_ROW / 16;
 
+    const int warp_row0 = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y * GROUPS_PER_WARP * ROWS_PER_GROUP;
+    if (warp_row0 >= nrows) {
+        return;
+    }
+
     const int lane          = threadIdx.x;
     const int group_in_warp = lane / THREADS_PER_ROW;
     const int lane_in_group = lane % THREADS_PER_ROW;
-    const int group_id      = threadIdx.y * GROUPS_PER_WARP + group_in_warp;
-    const int row0          = blockIdx.x * ROWS_PER_BLOCK + group_id * ROWS_PER_GROUP;
+    const int row0          = warp_row0 + group_in_warp * ROWS_PER_GROUP;
 
-    if constexpr (GROUPS_PER_WARP == 1) {
-        if (row0 >= nrows) {
-            return;
-        }
-    }
-
-    const uint32_t channel_dst = blockIdx.y;
-    const uint32_t sample_dst  = blockIdx.z;
-    const uint32_t channel_x   = fastdiv(channel_dst, channel_ratio);
-    const uint32_t sample_x    = fastdiv(sample_dst,  sample_ratio);
+    const uint32_t channel_x = fastdiv(blockIdx.y, channel_ratio);
+    const uint32_t sample_x  = fastdiv(blockIdx.z, sample_ratio);
 
     const block_q6_K * x_base = vx + sample_x * stride_sample_x + channel_x * stride_channel_x;
-    const float      * y_base = vy + sample_dst * stride_sample_y + channel_dst * stride_channel_y;
+    const float      * y_base = vy + blockIdx.z * stride_sample_y + blockIdx.y * stride_channel_y;
 
     // 16 threads cooperate per block_q6_K: each handles 16 weights (4 quarters of 4 elements).
     const int blk_in_group = lane_in_group >> 4;
@@ -312,14 +412,17 @@ static __global__ void mul_mat_vec_q6_K_kepler(
     const int i4           = sub & 7;  // 0..7 -> l0 = 4 * i4
     const int s_off        = 8 * h + (i4 >> 2);
 
+    const bool lane_has_blk = (blk_in_group < nb);
     const block_q6_K * row_ptrs[ROWS_PER_GROUP];
 #pragma unroll
     for (int r = 0; r < ROWS_PER_GROUP; ++r) {
         const int row = (row0 + r < nrows) ? (row0 + r) : 0;
-        row_ptrs[r] = x_base + row * stride_row_x + blk_in_group;
+        row_ptrs[r] = lane_has_blk ? (x_base + row * stride_row_x + blk_in_group) : nullptr;
     }
 
-    const float4 * y4 = reinterpret_cast<const float4 *>(y_base + static_cast<int64_t>(blk_in_group) * QK_K + 128 * h + 4 * i4);
+    const float4 * y4 = lane_has_blk
+        ? reinterpret_cast<const float4 *>(y_base + static_cast<int64_t>(blk_in_group) * QK_K + 128 * h + 4 * i4)
+        : nullptr;
 
     float acc[ROWS_PER_GROUP];
 #pragma unroll
@@ -328,7 +431,7 @@ static __global__ void mul_mat_vec_q6_K_kepler(
     }
 
     // Uniform loop bound across the warp so all lanes participate in __shfl_up_sync inside load_u32_q6_k.
-    for (int ib_base = 0; ib_base < nb; ib_base += BLOCKS_PER_ITER) {
+    for (int ib_base = 0; ; ) {
         const bool valid = (ib_base + blk_in_group) < nb;
 
         uint32_t ql0[ROWS_PER_GROUP];
@@ -336,10 +439,10 @@ static __global__ void mul_mat_vec_q6_K_kepler(
         uint32_t qh0[ROWS_PER_GROUP];
 #pragma unroll
         for (int r = 0; r < ROWS_PER_GROUP; ++r) {
-            const block_q6_K * blk = row_ptrs[r];
-            ql0[r] = load_u32_q6_k(blk->ql + 64 * h,      i4, valid);
-            ql1[r] = load_u32_q6_k(blk->ql + 64 * h + 32, i4, valid);
-            qh0[r] = load_u32_q6_k(blk->qh + 32 * h,      i4, valid);
+            const block_q6_K * blk = valid ? row_ptrs[r] : nullptr;
+            ql0[r] = load_u32_q6_k(valid ? (blk->ql + 64 * h)      : nullptr, i4, valid);
+            ql1[r] = load_u32_q6_k(valid ? (blk->ql + 64 * h + 32) : nullptr, i4, valid);
+            qh0[r] = load_u32_q6_k(valid ? (blk->qh + 32 * h)      : nullptr, i4, valid);
         }
 
         if (valid) {
@@ -388,21 +491,78 @@ static __global__ void mul_mat_vec_q6_K_kepler(
             }
         }
 
-#pragma unroll
-        for (int r = 0; r < ROWS_PER_GROUP; ++r) {
-            row_ptrs[r] += BLOCKS_PER_ITER;
+        ib_base += BLOCKS_PER_ITER;
+        if (ib_base >= nb) {
+            break;
         }
-        y4 += BLOCKS_PER_ITER * (QK_K / 4);
+        if (ib_base + blk_in_group < nb) {
+#pragma unroll
+            for (int r = 0; r < ROWS_PER_GROUP; ++r) {
+                row_ptrs[r] += BLOCKS_PER_ITER;
+            }
+            y4 += BLOCKS_PER_ITER * (QK_K / 4);
+        }
     }
 
-    float * dst_base = dst + sample_dst * stride_sample_dst + channel_dst * stride_channel_dst;
+    const int lane_out = threadIdx.x;
+    const int row0_out = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.y * GROUPS_PER_WARP + lane_out / THREADS_PER_ROW) * ROWS_PER_GROUP;
+    const int lig_out  = lane_out % THREADS_PER_ROW;
+    float * dst_base   = dst + blockIdx.z * stride_sample_dst + blockIdx.y * stride_channel_dst;
 #pragma unroll
     for (int r = 0; r < ROWS_PER_GROUP; ++r) {
         const float sum = warp_reduce_sum<THREADS_PER_ROW>(acc[r]);
-        if (lane_in_group == 0 && row0 + r < nrows) {
-            dst_base[row0 + r] = sum;
+        if (lig_out == 0 && row0_out + r < nrows) {
+            dst_base[row0_out + r] = sum;
         }
     }
+}
+
+template <int THREADS_PER_ROW, int ROWS_PER_GROUP, int WARPS_PER_BLOCK>
+static void launch_mmvk_q4_k(
+        const block_q4_K * src0_d, const float * src1_d, float * dst_d,
+        const int nb, const int nrows, const int64_t stride_row_x,
+        const uint3 channel_ratio, const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
+        const uint3 sample_ratio,  const int64_t stride_sample_x,  const int64_t stride_sample_y,  const int64_t stride_sample_dst,
+        const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    constexpr int groups_per_block = WARPS_PER_BLOCK * (WARP_SIZE / THREADS_PER_ROW);
+    constexpr int rows_per_block   = groups_per_block * ROWS_PER_GROUP;
+    const unsigned int nblocks_x   = static_cast<unsigned int>((static_cast<int64_t>(nrows) + rows_per_block - 1) / rows_per_block);
+
+    const dim3 block_nums(nblocks_x, static_cast<unsigned int>(ne2), static_cast<unsigned int>(ne3));
+    const dim3 block_dims(WARP_SIZE, WARPS_PER_BLOCK, 1);
+    const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
+
+    ggml_cuda_kernel_launch(
+        mul_mat_vec_q4_K_kepler<THREADS_PER_ROW, ROWS_PER_GROUP, WARPS_PER_BLOCK>,
+        launch_params,
+        src0_d, src1_d, dst_d,
+        nb, nrows, stride_row_x,
+        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+        sample_ratio,  stride_sample_x,  stride_sample_y,  stride_sample_dst);
+}
+
+template <int THREADS_PER_ROW, int ROWS_PER_GROUP, int WARPS_PER_BLOCK>
+static void launch_mmvk_q6_k(
+        const block_q6_K * src0_d, const float * src1_d, float * dst_d,
+        const int nb, const int nrows, const int64_t stride_row_x,
+        const uint3 channel_ratio, const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
+        const uint3 sample_ratio,  const int64_t stride_sample_x,  const int64_t stride_sample_y,  const int64_t stride_sample_dst,
+        const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    constexpr int groups_per_block = WARPS_PER_BLOCK * (WARP_SIZE / THREADS_PER_ROW);
+    constexpr int rows_per_block   = groups_per_block * ROWS_PER_GROUP;
+    const unsigned int nblocks_x   = static_cast<unsigned int>((static_cast<int64_t>(nrows) + rows_per_block - 1) / rows_per_block);
+
+    const dim3 block_nums(nblocks_x, static_cast<unsigned int>(ne2), static_cast<unsigned int>(ne3));
+    const dim3 block_dims(WARP_SIZE, WARPS_PER_BLOCK, 1);
+    const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
+
+    ggml_cuda_kernel_launch(
+        mul_mat_vec_q6_K_kepler<THREADS_PER_ROW, ROWS_PER_GROUP, WARPS_PER_BLOCK>,
+        launch_params,
+        src0_d, src1_d, dst_d,
+        nb, nrows, stride_row_x,
+        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+        sample_ratio,  stride_sample_x,  stride_sample_y,  stride_sample_dst);
 }
 
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -538,40 +698,74 @@ bool ggml_cuda_mul_mat_vec_kepler(
     cudaStream_t  stream = ctx.stream();
 
     if (src0->type == GGML_TYPE_Q4_K) {
-        constexpr int groups_per_block = MMVK_Q4_K_WARPS_PER_BLOCK * (WARP_SIZE / MMVK_Q4_K_THREADS_PER_ROW);
-        constexpr int rows_per_block   = groups_per_block * MMVK_Q4_K_ROWS_PER_GROUP;
-        const int     nblocks_x        = (nrows + rows_per_block - 1) / rows_per_block;
-
-        const dim3 block_nums(nblocks_x, static_cast<unsigned int>(dst->ne[2]), static_cast<unsigned int>(dst->ne[3]));
-        const dim3 block_dims(WARP_SIZE, MMVK_Q4_K_WARPS_PER_BLOCK, 1);
-        const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
-
-        ggml_cuda_kernel_launch(
-            mul_mat_vec_q4_K_kepler<MMVK_Q4_K_THREADS_PER_ROW, MMVK_Q4_K_ROWS_PER_GROUP, MMVK_Q4_K_WARPS_PER_BLOCK>,
-            launch_params,
-            static_cast<const block_q4_K *>(src0->data), src1_d, dst_d,
-            nb, nrows, stride_row_x,
-            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-            sample_ratio,  stride_sample_x,  stride_sample_y,  stride_sample_dst);
+        const block_q4_K * src0_d = static_cast<const block_q4_K *>(src0->data);
+        switch (ggml_cuda_kepler_mmv_q4k_variant()) {
+            case MMVK_Q4_K_32x1x8:
+                launch_mmvk_q4_k<32, 1, 8>(
+                    src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+                    channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio,  stride_sample_x,  stride_sample_y,  stride_sample_dst,
+                    dst->ne[2], dst->ne[3], stream);
+                break;
+            case MMVK_Q4_K_32x2x4:
+                launch_mmvk_q4_k<32, 2, 4>(
+                    src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+                    channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio,  stride_sample_x,  stride_sample_y,  stride_sample_dst,
+                    dst->ne[2], dst->ne[3], stream);
+                break;
+            case MMVK_Q4_K_8x1x4:
+                launch_mmvk_q4_k<8, 1, 4>(
+                    src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+                    channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio,  stride_sample_x,  stride_sample_y,  stride_sample_dst,
+                    dst->ne[2], dst->ne[3], stream);
+                break;
+            case MMVK_Q4_K_32x1x4:
+            default:
+                launch_mmvk_q4_k<32, 1, 4>(
+                    src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+                    channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio,  stride_sample_x,  stride_sample_y,  stride_sample_dst,
+                    dst->ne[2], dst->ne[3], stream);
+                break;
+        }
         return true;
     }
 
     if (src0->type == GGML_TYPE_Q6_K) {
-        constexpr int groups_per_block = MMVK_Q6_K_WARPS_PER_BLOCK * (WARP_SIZE / MMVK_Q6_K_THREADS_PER_ROW);
-        constexpr int rows_per_block   = groups_per_block * MMVK_Q6_K_ROWS_PER_GROUP;
-        const int     nblocks_x        = (nrows + rows_per_block - 1) / rows_per_block;
-
-        const dim3 block_nums(nblocks_x, static_cast<unsigned int>(dst->ne[2]), static_cast<unsigned int>(dst->ne[3]));
-        const dim3 block_dims(WARP_SIZE, MMVK_Q6_K_WARPS_PER_BLOCK, 1);
-        const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
-
-        ggml_cuda_kernel_launch(
-            mul_mat_vec_q6_K_kepler<MMVK_Q6_K_THREADS_PER_ROW, MMVK_Q6_K_ROWS_PER_GROUP, MMVK_Q6_K_WARPS_PER_BLOCK>,
-            launch_params,
-            static_cast<const block_q6_K *>(src0->data), src1_d, dst_d,
-            nb, nrows, stride_row_x,
-            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-            sample_ratio,  stride_sample_x,  stride_sample_y,  stride_sample_dst);
+        const block_q6_K * src0_d = static_cast<const block_q6_K *>(src0->data);
+        switch (ggml_cuda_kepler_mmv_q6k_variant()) {
+            case MMVK_Q6_K_32x1x4:
+                launch_mmvk_q6_k<32, 1, 4>(
+                    src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+                    channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio,  stride_sample_x,  stride_sample_y,  stride_sample_dst,
+                    dst->ne[2], dst->ne[3], stream);
+                break;
+            case MMVK_Q6_K_32x1x8:
+                launch_mmvk_q6_k<32, 1, 8>(
+                    src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+                    channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio,  stride_sample_x,  stride_sample_y,  stride_sample_dst,
+                    dst->ne[2], dst->ne[3], stream);
+                break;
+            case MMVK_Q6_K_16x1x4:
+                launch_mmvk_q6_k<16, 1, 4>(
+                    src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+                    channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio,  stride_sample_x,  stride_sample_y,  stride_sample_dst,
+                    dst->ne[2], dst->ne[3], stream);
+                break;
+            case MMVK_Q6_K_32x2x4:
+            default:
+                launch_mmvk_q6_k<32, 2, 4>(
+                    src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+                    channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio,  stride_sample_x,  stride_sample_y,  stride_sample_dst,
+                    dst->ne[2], dst->ne[3], stream);
+                break;
+        }
         return true;
     }
 
