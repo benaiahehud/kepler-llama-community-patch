@@ -309,9 +309,13 @@ static __global__ void rope_multi(const T *            x,
     rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, iw, ext_factor, attn_factor, cos_theta, sin_theta);
 
     // idst/ix point at channel i0/2; the first channel of the rotated pair is n_offs + iw/2 = i0/2 + n_offs/2
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float x0 = x[ix + n_offs/2 + 0];
     const float x1 = x[ix + n_offs/2 + n_dims/2];
-
+#else
+    const float x0 = __half2float(x[ix + n_offs/2 + 0]);
+    const float x1 = __half2float(x[ix + n_offs/2 + n_dims/2]);
+#endif
     dst[idst + n_offs/2 + 0]        = ggml_cuda_cast<D>(x0*cos_theta - x1*sin_theta);
     dst[idst + n_offs/2 + n_dims/2] = ggml_cuda_cast<D>(x0*sin_theta + x1*cos_theta);
 }

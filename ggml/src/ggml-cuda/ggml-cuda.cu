@@ -339,9 +339,13 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.devices[id].smpb       = prop.sharedMemPerBlock;
         info.devices[id].warp_size  = prop.warpSize;
 
+#if CUDART_VERSION > 8000 || (!defined(CUDART_VERSION) && !defined(GGML_USE_MUSA))
         int supports_coop_launch = 0;
         CUDA_CHECK(cudaDeviceGetAttribute(&supports_coop_launch, cudaDevAttrCooperativeLaunch, physical_id));
         info.devices[id].supports_cooperative_launch = !!supports_coop_launch;
+#else
+        info.devices[id].supports_cooperative_launch = false;
+#endif // CUDART_VERSION > 8000 || (!defined(CUDART_VERSION) && !defined(GGML_USE_MUSA))
 
 #if defined(GGML_USE_HIP)
         info.devices[id].smpbo = prop.sharedMemPerBlock;
