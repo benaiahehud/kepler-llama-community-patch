@@ -32,6 +32,7 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
+#include "ggml-cuda/mmvk.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -1908,6 +1909,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
+    if (tensor->op == GGML_OP_MUL_MAT && ggml_cuda_should_use_mmvk(src0, src1, dst, cc)) {
+        return false;
+    }
     //we only support fusion for ncols_dst = 1
     if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
         return false;
@@ -2072,6 +2076,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+        if (ggml_cuda_should_use_mmvk(src0, src1, dst, cc) &&
+                ggml_cuda_mul_mat_vec_kepler(ctx, src0, src1, dst)) {
+            return;
+        }
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
