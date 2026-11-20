@@ -112,7 +112,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i*sram_stride                           + ksx] = bxi->d;
 #else
+        #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
         x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + ksx] = bxi->d;
+        #else
+        x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + ksx] = __half2float(bxi->d);
+        #endif
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }
@@ -203,7 +207,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i*sram_stride                           + ksx] = bxi->d;
 #else
+        #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
         x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + ksx] = bxi->d;
+        #else
+        x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + ksx] = __half2float(bxi->d);
+        #endif
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }
@@ -268,7 +276,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i*sram_stride                     + kbxd] = bxi->d;
 #else
+        #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
         x_df[i*(MMQ_TILE_NE_K/QI4_0) + i/QI4_0 + kbxd] = bxi->d;
+        #else
+        x_df[i*(MMQ_TILE_NE_K/QI4_0) + i/QI4_0 + kbxd] = __half2float(bxi->d);
+        #endif
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }
@@ -415,7 +427,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i*sram_stride                     + kbxd] = bxi->d;
 #else
+        #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
         x_df[i*(MMQ_TILE_NE_K/QI5_0) + i/QI5_0 + kbxd] = bxi->d;
+        #else
+        x_df[i*(MMQ_TILE_NE_K/QI5_0) + i/QI5_0 + kbxd] = __half2float(bxi->d);
+        #endif
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)  || defined(AMD_WMMA_AVAILABLE)
     }
 }
@@ -559,7 +575,11 @@ template <ggml_type type, int J, bool fallback, bool has_fusion> static __device
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i*sram_stride                           + kbxd] = bxi->d;
 #else
+        #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
         x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + kbxd] = bxi->d;
+        #else
+        x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + kbxd] = __half2float(bxi->d);
+        #endif
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }
@@ -729,7 +749,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
         const block_q3_K * bxi = (const block_q3_K *) x + kbx0 + i*stride;
 
+        #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
         x_df[i] = bxi->d;
+        #else
+        x_df[i] = __half2float(bxi->d);
+        #endif
     }
 #endif // !(defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)) || defined(AMD_WMMA_AVAILABLE)
 }
@@ -1044,7 +1068,11 @@ template <ggml_type type, int J, bool fallback, bool has_fusion> static __device
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i*sram_stride]                     = bxi->d;
 #else
+        #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
         x_df[i*(MMQ_TILE_NE_K/QI6_K) + i/QI6_K] = bxi->d;
+        #else
+        x_df[i*(MMQ_TILE_NE_K/QI6_K) + i/QI6_K] = __half2float(bxi->d);
+        #endif
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 
@@ -1190,7 +1218,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         }
 
         const int ls = aux32 >> 27 | 1; // (scale * 2 + 1)
+        #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
         const float d = bxi->d;
+        #else
+        const float d = __half2float(bxi->d);
+        #endif
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i*sram_stride             + kqsx] = d * ls / 8; // (d * scale + d / 2) / 4
 #else
@@ -1255,7 +1287,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         }
 
         const int ls = bxi->scales[kqsx];
+        #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
         const float d = bxi->d;
+        #else
+        const float d = __half2float(bxi->d);
+        #endif
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i*sram_stride                             + 2*kqsx+0] = ((ls &  0x0F)*d + d/2)/4;
         x_df[i*sram_stride                             + 2*kqsx+1] = ((ls >>    4)*d + d/2)/4;
@@ -1325,7 +1361,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         }
 
         const int ls = bxi->scales[kqsx];
+        #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
         const float d = bxi->d;
+        #else
+        const float d = __half2float(bxi->d);
+        #endif
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i*sram_stride                             + 2*kqsx+0] = ((ls &  0x0F)*d + d/2)/4;
         x_df[i*sram_stride                             + 2*kqsx+1] = ((ls >>    4)*d + d/2)/4;
@@ -1393,7 +1433,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         }
 
         const int ls = aux32 >> 28;
+        #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
         const float d = bxi->d;
+        #else
+        const float d = __half2float(bxi->d);
+        #endif
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i*sram_stride             + kqsx] = (ls*d + d/2)/2;
 #else
@@ -1464,7 +1508,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         }
 
         const int ls = 1 + 2*((bxi->scales[kqsx/2] >> (((2*kqsx) << 1) & 0x04)) & 0x0F);
+        #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
         const float d = bxi->d;
+        #else
+        const float d = __half2float(bxi->d);
+        #endif
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i*sram_stride             + kqsx] = ls*d;
 #else

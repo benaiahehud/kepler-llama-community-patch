@@ -1,4 +1,5 @@
 #include "im2col.cuh"
+#include "convert.cuh" // #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
 
 #define MAX_GRIDDIM_Y 65535
 #define MAX_GRIDDIM_Z 65535
@@ -34,10 +35,18 @@ static  __global__ void im2col_kernel(
                     ((in * OH + ioh) * OW + iow) * IC_KH_KW + iic * KH_KW + ikh * KW + ikw;
 
                 if (iih < 0 || iih >= IH || iiw < 0 || iiw >= IW) {
+                    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
                     dst[offset_dst] = 0.0f;
+                    #else
+                    dst[offset_dst] = ggml_cuda_cast<T>(0.0f);
+                    #endif
                 } else {
                     const int64_t offset_src = iic * IC_IH_IW + in * IH_IW;
+                    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
                     dst[offset_dst] = x[offset_src + iih * IW + iiw];
+                    #else
+                    dst[offset_dst] = ggml_cuda_cast<T>(x[offset_src + iih * IW + iiw]);
+                    #endif
                 }
             }
         }
@@ -154,10 +163,18 @@ static  __global__ void im2col_3d_kernel(
             const int64_t offset_dst = in*OD_OH_OW_IC_KD_KH_KW + iod*OH_OW_IC_KD_KH_KW + ioh*OW_IC_KD_KH_KW + iow*IC_KD_KH_KW + iic*KD_KH_KW + ikd * KH_KW + ikh*KW + ikw;
 
             if (iih < 0 || iih >= IH || iiw < 0 || iiw >= IW || iid < 0 || iid >= ID) {
+                #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
                 dst[offset_dst] = 0.0f;
+                #else
+                dst[offset_dst] = ggml_cuda_cast<T>(0.0f);
+                #endif
             } else {
                 const int64_t offset_src = ((in * IC + iic) * stride_q) + (iid * stride_z) + (iih * stride_y) + (iiw * stride_x);
+                #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
                 dst[offset_dst] = src[offset_src];
+                #else
+                dst[offset_dst] = ggml_cuda_cast<T>(src[offset_src]);
+                #endif
             }
         }
     }

@@ -193,8 +193,13 @@ static __global__ void mul_mat_vec_f(
             }
         } else {
 #ifdef FP16_AVAILABLE
+            #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
             half2 sumh2[ncols_dst] = {{0.0f, 0.0f}};
             half2 sumh2_gate[ncols_dst] = {{0.0f, 0.0f}};
+            #else
+            half2 sumh2[ncols_dst] = {__floats2half2_rn(0.0f, 0.0f)};
+            half2 sumh2_gate[ncols_dst] = {__floats2half2_rn(0.0f, 0.0f)};
+            #endif
 
             for (int col2 = tid; col2 < ncols2; col2 += block_size) {
                 const half2 tmpx = x2[col2];
@@ -207,11 +212,19 @@ static __global__ void mul_mat_vec_f(
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
                     const float2 tmpy = y2[j*stride_col_y2 + col2];
+                    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
                     sumh2[j] += tmpx * make_half2(tmpy.x, tmpy.y);
+                    #else
+                    sumh2[j] = __hadd2(sumh2[j], __hmul2(tmpx, make_half2(tmpy.x, tmpy.y)));
+                    #endif
 
                     if constexpr (has_fusion) {
                         if (use_gate) {
+                            #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
                             sumh2_gate[j] += tmpx_gate * make_half2(tmpy.x, tmpy.y);
+                            #else
+                            sumh2_gate[j] = __hadd2(sumh2_gate[j], __hmul2(tmpx_gate, make_half2(tmpy.x, tmpy.y)));
+                            #endif
                         }
                     }
                 }
@@ -234,7 +247,9 @@ static __global__ void mul_mat_vec_f(
             NO_DEVICE_CODE;
 #endif // FP16_AVAILABLE
         }
-    } else if constexpr (std::is_same_v<T, nv_bfloat16>) {
+    }
+    #if CUDART_VERSION >= 11000 || !defined(CUDART_VERSION)
+    else if constexpr (std::is_same_v<T, nv_bfloat16>) {
 //TODO: add support for ggml_cuda_mad for hip_bfloat162
 #if defined(GGML_USE_HIP)
         const int * x2 = (const int *) x;
@@ -301,7 +316,9 @@ static __global__ void mul_mat_vec_f(
             }
         }
 #endif
-    } else {
+    }
+    #endif // CUDART_VERSION >= 11000 || !defined(CUDART_VERSION)
+    else {
         static_assert(std::is_same_v<T, void>, "unsupported type");
     }
 

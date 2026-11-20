@@ -493,7 +493,11 @@ static __global__ void swiglu_clamp_kernel(const T * gate, const T * up, T * dst
     const int64_t j0 = (i / n) * o0 + (i % n);
     const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     dst[i] = (T) ggml_cuda_op_swiglu_clamp_single((float) gate[j0], (float) up[j1], limit);
+    #else
+    dst[i] = ggml_cuda_cast<T>(ggml_cuda_op_swiglu_clamp_single(__half2float(gate[j0]), __half2float(up[j1]), limit));
+    #endif
 }
 
 template <typename T>
@@ -625,7 +629,11 @@ static __global__ void silu_back_kernel(const T * grad, const T * xf, T * dst, c
         return;
     }
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     dst[i] = (T)op_silu_back((float)grad[i], (float)xf[i]);
+    #else
+    dst[i] = ggml_cuda_cast<T>(op_silu_back(__half2float(grad[i]), __half2float(xf[i])));
+    #endif
 }
 
 template <class T>
@@ -671,7 +679,11 @@ static __global__ void leaky_relu_kernel(const T * x, T * dst, const int k, cons
         return;
     }
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     dst[i] = (T)op_leaky_relu((float)x[i], negative_slope);
+    #else
+    dst[i] = ggml_cuda_cast<T>(op_leaky_relu(__half2float(x[i]), negative_slope));
+    #endif
 }
 
 template <class T>

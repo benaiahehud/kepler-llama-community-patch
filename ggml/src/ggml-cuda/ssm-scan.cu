@@ -8,6 +8,7 @@ using namespace cub;
 #endif // USE_CUB
 
 #include "ssm-scan.cuh"
+#include "convert.cuh" // #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
 
 
 // Minimum number of tokens to use SSD (State Space Duality) matmul path instead of scan path.
@@ -501,7 +502,11 @@ __global__ void ssm_ssd_pre_matmul_kernel(
         const float x_val = x[s * x_stride_seq + (chunk_offset + t) * x_stride_tok + d + h * head_dim];
         const float dt_val = dt_sp[cs_seq_off + (chunk_offset + t) * n_head + h];
 
+        #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
         X_dt[d + t * head_dim + h * n_xdt + s * n_xdt * n_head] = (T_matmul)(x_val * dt_val);
+        #else
+        X_dt[d + t * head_dim + h * n_xdt + s * n_xdt * n_head] = ggml_cuda_cast<T_matmul>(x_val * dt_val);
+        #endif
     }
 
     // Prepare B_weighted and C_scaled together: both share the same index space (d_state * chunk_len)
@@ -514,7 +519,11 @@ __global__ void ssm_ssd_pre_matmul_kernel(
         const float cs_t = cs[cs_seq_off + (chunk_offset + t) * n_head + h] - cs_base;
 
         const float B_val = B[s * B_stride_seq + (chunk_offset + t) * B_stride_tok + g * d_state + n];
+        #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
         B_weighted[n + t * d_state + h * n_bw + s * n_bw * n_head] = (T_matmul)(B_val * __expf(A_h * (cs_last - cs_t)));
+        #else
+        B_weighted[n + t * d_state + h * n_bw + s * n_bw * n_head] = ggml_cuda_cast<T_matmul>(B_val * __expf(A_h * (cs_last - cs_t)));
+        #endif
 
         const float C_val = C_src[s * C_stride_seq + (chunk_offset + t) * C_stride_tok + g * d_state + n];
         C_scaled[n + t * d_state + h * n_bw + s * n_bw * n_head] = C_val * __expf(A_h * cs_t);

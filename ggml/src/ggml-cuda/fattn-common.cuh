@@ -322,7 +322,11 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
         const float2 * Q_ds = (const float2 *) Q_ds_v;
         const float Q_d = Q_ds[k_KQ_0/nthreads].x;
 
+        #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
         sum += vec_dot_q8_0_q8_1_impl<float, 1>(&v, &Q_q8[k_KQ_0/nthreads], K_q8_0[ib].d, Q_d);
+        #else
+        sum += vec_dot_q8_0_q8_1_impl<float, 1>(&v, &Q_q8[k_KQ_0/nthreads], __half2float(K_q8_0[ib].d), Q_d);
+        #endif
     }
 
     return sum;
@@ -433,12 +437,20 @@ static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict
 
 #pragma unroll
         for (int l0 = 0; l0 < ne; l0 += 2) {
+            #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
             ((half2 *) dst)[l0/2] = d * make_half2(q8[l0 + 0], q8[l0 + 1]);
+            #else
+            ((half2 *) dst)[l0/2] = __hmul2(d, make_half2(q8[l0 + 0], q8[l0 + 1]));
+            #endif
         }
     } else
 #endif // FP16_AVAILABLE
     if constexpr (std::is_same_v<T, float>) {
+        #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
         const float d = x[ib].d;
+        #else
+        const float d = __half2float(x[ib].d);
+        #endif
 
 #pragma unroll
         for (int l = 0; l < ne; ++l) {
@@ -473,7 +485,11 @@ static __device__ __forceinline__ void dequantize_V_q4_1(const void * __restrict
 
 #pragma unroll
         for (int l0 = 0; l0 < ne; l0 += 2) {
+            #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
             ((half2 *) dst)[l0/2] = d * make_half2(q8[l0 + 0], q8[l0 + 1]) + m;
+            #else
+            ((half2 *) dst)[l0/2] = __hadd2(__hmul2(d, make_half2(q8[l0 + 0], q8[l0 + 1])), m);
+            #endif
         }
     } else
 #endif // FP16_AVAILABLE
@@ -523,12 +539,20 @@ static __device__ __forceinline__ void dequantize_V_q5_0(const void * __restrict
 
 #pragma unroll
         for (int l0 = 0; l0 < ne; l0 += 2) {
+            #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
             ((half2 *) dst)[l0/2] = d * make_half2(q8[l0 + 0], q8[l0 + 1]);
+            #else
+            ((half2 *) dst)[l0/2] = __hmul2(d, make_half2(q8[l0 + 0], q8[l0 + 1]));
+            #endif
         }
     } else
 #endif // FP16_AVAILABLE
     if constexpr (std::is_same_v<T, float>) {
+        #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
         const float d = x[ib].d;
+        #else
+        const float d = __half2float(x[ib].d);
+        #endif
 
 #pragma unroll
         for (int l = 0; l < ne; ++l) {
@@ -573,7 +597,11 @@ static __device__ __forceinline__ void dequantize_V_q5_1(const void * __restrict
 
 #pragma unroll
         for (int l0 = 0; l0 < ne; l0 += 2) {
+            #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
             ((half2 *) dst)[l0/2] = d * make_half2(q8[l0 + 0], q8[l0 + 1]) + m;
+            #else
+            ((half2 *) dst)[l0/2] = __hadd2(__hmul2(d, make_half2(q8[l0 + 0], q8[l0 + 1])), m);
+            #endif
         }
     } else
 #endif // FP16_AVAILABLE
@@ -611,7 +639,11 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     } else
 #endif // FP16_AVAILABLE
     if constexpr (std::is_same<T, float>::value) {
+        #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
         const float d = x[ib].d;
+        #else
+        const float d = __half2float(x[ib].d);
+        #endif
 
 #pragma unroll
         for (int l = 0; l < ne; ++l) {
@@ -950,7 +982,7 @@ static __global__ void flash_attn_combine_results(
     dst       += j_dst_unrolled *                 D;
 
     const int tid = threadIdx.x;
-    __builtin_assume(tid < D);
+    GGML_CUDA_ASSUME(tid < D);
 
     extern __shared__ float2 meta[];
     ggml_cuda_pdl_sync();

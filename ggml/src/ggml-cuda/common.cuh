@@ -47,7 +47,9 @@
 #define CUDART_HMAX   11070 // CUDA 11.7, min. ver. for which __hmax and __hmax2 are known to work (may be higher than needed)
 #define CUDART_HMASK  12000 // CUDA 12.0, min. ver. for half2 -> uint mask comparisons
 
-#define GGML_CUDA_CC_PASCAL          600
+#define GGML_CUDA_CC_KEPLER          300 // minimum compute capability for __shfl, an intrinsic for shuffle
+#define GGML_CUDA_CC_MAXWELL3        530 // minimum compute capability for FP16
+#define GGML_CUDA_CC_PASCAL          600 // TODO: Change the GGML_CUDA_CC_PASCAL(half-related macro code) to GGML_CUDA_CC_MAXWELL3
 #define GGML_CUDA_CC_DP4A            610 // minimum compute capability for __dp4a, an intrinsic for byte-wise dot products
 #define GGML_CUDA_CC_VOLTA           700
 #define GGML_CUDA_CC_TURING          750
@@ -307,7 +309,7 @@ static const char * cu_get_error_str(CUresult err) {
 #endif // !defined(GGML_CUDA_NO_FA) && !(defined(GGML_USE_MUSA) && __MUSA_ARCH__ < 220)
 
 static bool fp16_available(const int cc) {
-    return ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_PASCAL ||
+    return ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_MAXWELL3 ||
         (GGML_CUDA_CC_IS_MTHREADS(cc) && cc >= GGML_CUDA_CC_PH1);
 }
 
@@ -319,7 +321,7 @@ static bool fast_fp16_available(const int cc) {
 
 // To be used for feature selection of external libraries, e.g. cuBLAS.
 static bool fast_fp16_hardware_available(const int cc) {
-    return (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_PASCAL && cc != 610) || GGML_CUDA_CC_IS_AMD(cc) ||
+    return (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_MAXWELL3 && cc != 610) || GGML_CUDA_CC_IS_AMD(cc) ||
         (GGML_CUDA_CC_IS_MTHREADS(cc) && cc >= GGML_CUDA_CC_QY2);
 }
 
@@ -504,11 +506,16 @@ static __device__ __forceinline__ int warp_reduce_all(int x) {
     if (width == ggml_cuda_get_physical_warp_size()) {
         return __all_sync(0xffffffff, x);
     } else {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_KEPELE
 #pragma unroll
         for (int offset = width/2; offset > 0; offset >>= 1) {
             x = __shfl_xor_sync(0xffffffff, x, offset, width) && x;
         }
         return x;
+#else
+        NO_DEVICE_CODE;
+        return x;
+#endif
     }
 }
 
@@ -517,25 +524,36 @@ static __device__ __forceinline__ int warp_reduce_any(int x) {
     if (width == ggml_cuda_get_physical_warp_size()) {
         return __any_sync(0xffffffff, x);
     } else {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_KEPELE
 #pragma unroll
         for (int offset = width/2; offset > 0; offset >>= 1) {
             x = __shfl_xor_sync(0xffffffff, x, offset, width) || x;
         }
         return x;
+#else
+        NO_DEVICE_CODE;
+        return x;
+#endif
     }
 }
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_max(float x) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_KEPELE
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
         x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, offset, width));
     }
     return x;
+#else
+    NO_DEVICE_CODE;
+    return x;
+#endif
 }
 
 template<typename T, int width = WARP_SIZE>
 static __device__ __forceinline__ T warp_prefix_inclusive_sum(T x) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_KEPELE
     const int lane_id = threadIdx.x % width;
 #pragma unroll
     for (int offset = 1; offset < width; offset <<= 1) {
@@ -545,10 +563,15 @@ static __device__ __forceinline__ T warp_prefix_inclusive_sum(T x) {
         }
     }
     return x;
+#else
+    NO_DEVICE_CODE;
+    return x;
+#endif
 }
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float2 warp_prefix_inclusive_sum(float2 a) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_KEPELE
     const int lane_id = threadIdx.x % width;
 #pragma unroll
     for (int offset = 1; offset < width; offset <<= 1) {
@@ -560,6 +583,10 @@ static __device__ __forceinline__ float2 warp_prefix_inclusive_sum(float2 a) {
         }
     }
     return a;
+#else
+    NO_DEVICE_CODE;
+    return a;
+#endif
 }
 
 template<int width = WARP_SIZE>
@@ -703,8 +730,14 @@ static __device__ __forceinline__ half2 warp_reduce_max(half2 x) {
 #if (defined(CUDART_VERSION) && CUDART_VERSION < CUDART_HMASK) || defined(GGML_USE_HIP) || \
     (defined(MUSART_VERSION) && MUSART_VERSION < MUSART_HMASK)
 static __device__ __forceinline__ uint32_t __hgt2_mask(const half2 a, const half2 b) {
-    const uint32_t mask_low  = 0x0000FFFF * (float( __low2half(a)) > float( __low2half(b)));
-    const uint32_t mask_high = 0xFFFF0000 * (float(__high2half(a)) > float(__high2half(b)));
+    #ifdef FP16_AVAILABLE
+    __half2 cmp = __hgt2(a, b);
+    const uint32_t mask_low  = 0x0000FFFF *  __low2float(cmp);
+    const uint32_t mask_high = 0xFFFF0000 * __high2float(cmp);
+    #else
+    const uint32_t mask_low  = 0x0000FFFF * (__half2float( __low2half(a)) > __half2float( __low2half(b)));
+    const uint32_t mask_high = 0xFFFF0000 * (__half2float(__high2half(a)) > __half2float(__high2half(b)));
+    #endif
     return mask_low | mask_high;
 }
 #endif // (defined(CUDART_VERSION) && CUDART_VERSION < CUDART_HMASK) || defined(GGML_USE_HIP) || (defined(MUSART_VERSION) && MUSART_VERSION < MUSART_HMASK)

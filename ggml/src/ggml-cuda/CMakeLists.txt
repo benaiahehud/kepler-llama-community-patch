@@ -18,10 +18,27 @@ find_package(CUDAToolkit)
 if (CUDAToolkit_FOUND)
     message(STATUS "CUDA Toolkit found")
 
+    # unconfirmed patch: EOL ver. maybe 11... maybe 10... maybe 9...
+    #if (CUDAToolkit_VERSION VERSION_LESS "12")
+    #    message(WARNING "CUDA Toolkit < v12 is EOL! Although it compiles normally, normal operation is not guaranteed, and issues within the EOL scope may not be accepted for submission.")
+    #endif()
+    if (${CMAKE_CUDA_COMPILER_ID} MATCHES "Clang")
+        message(WARNING "Cooperative Groups support of only nvcc, use by softmax.cu file of 'soft_max_f32_parallelize_cols_single_row' function")
+        if (CUDAToolkit_VERSION VERSION_LESS "4.1")
+            message(FATAL_ERROR "Clang must CUDA Toolkit >= v4.1") # PTX ISA 3.0(ptx30)
+        endif()
+    endif()
+
     if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
         # native == GPUs available at build time
+        # 20     == Fermi, __ballot (Warp Vote Functions), LLVM-IR NVPTX (-DCMAKE_CUDA_COMPILER=clang) compiler support, end of CUDA v8.0
+        #  Thx very much <LLVM Project> and <Kitware CMake> always keep compatibility with the old NVIDIA architecture :-)
+        #  https://llvm.org/docs/CodeGenerator.html#the-nvptx-backend
+        #  https://llvm.org/docs/NVPTXUsage.html#nvptx-architecture-hierarchy-and-ordering
+        # 30     == Kepler, __shfl instruction (shuffle), end of CUDA v10.2
         # 50     == Maxwell, lowest CUDA 12 standard
-        # 60     == P100, FP16 CUDA intrinsics
+        # 53     == Maxwell3, FP16 CUDA intrinsics, but it's Tegra, so not in "if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)"
+        # 60     == P100, Cooperative Groups support
         # 61     == Pascal, __dp4a instruction (per-byte integer dot product)
         # 70     == V100, FP16 tensor cores
         # 75     == Turing, int8 tensor cores
@@ -40,14 +57,51 @@ if (CUDAToolkit_FOUND)
         if (GGML_NATIVE AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.6" AND CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
             set(CMAKE_CUDA_ARCHITECTURES "native")
         else()
-            if (CUDAToolkit_VERSION VERSION_LESS "13")
-                list(APPEND CMAKE_CUDA_ARCHITECTURES 50-virtual 61-virtual 70-virtual)
-            endif ()
+            # EOL
+            if (NOT ${CMAKE_CUDA_COMPILER_ID} MATCHES "Clang")#TODO => clang: error: unsupported CUDA gpu architecture: sm_1Y
+                if (CUDAToolkit_VERSION VERSION_LESS_EQUAL "6.0") #sm_10 = Tesla G80
+                    list(APPEND CMAKE_CUDA_ARCHITECTURES 10-real)
+                endif()
+                if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "2.0" AND CUDAToolkit_VERSION VERSION_LESS "7") #Tesla, end of CUDA v6.5
+                    list(APPEND CMAKE_CUDA_ARCHITECTURES 11-real 12-real 13-real)
+                endif()
+            endif()
+            if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "3.0" AND CUDAToolkit_VERSION VERSION_LESS "9") #sm_20 = Fermi, end of CUDA v8.0
+                if (${CMAKE_CUDA_COMPILER_ID} MATCHES "Clang")
+                    list(APPEND CMAKE_CUDA_ARCHITECTURES 20-real 21-real)#because 'Clang doesn't support disabling CUDA real code generation.'
+                else()
+                    list(APPEND CMAKE_CUDA_ARCHITECTURES 20-virtual)#nvcc unsupport compile sm_21
+                endif()
+            endif()
+            if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "4.2" AND CUDAToolkit_VERSION VERSION_LESS "11") #sm_30 = Kepler old, end of CUDA v10.2
+                list(APPEND CMAKE_CUDA_ARCHITECTURES 30-virtual)
+            endif()
+            if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "5.0" AND CUDAToolkit_VERSION VERSION_LESS "12") #sm_35 = Kepler new, end of CUDA v11.8
+                list(APPEND CMAKE_CUDA_ARCHITECTURES 35-virtual)
+            endif()
+            if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "6.0" AND CUDAToolkit_VERSION VERSION_LESS "13") #Maxwell~Volta, end of CUDA v12.9.2
+                list(APPEND CMAKE_CUDA_ARCHITECTURES 50-virtual)
+                if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "8.0") #sm_61 = Pascal, __dp4a instruction (per-byte integer dot product)
+                    list(APPEND CMAKE_CUDA_ARCHITECTURES 61-virtual)
+                endif()
+                if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "9.0")# AND CUDAToolkit_VERSION VERSION_EQUAL "9.1" AND ${CMAKE_CUDA_COMPILER_ID} MATCHES "Clang")
+                    list(APPEND CMAKE_CUDA_ARCHITECTURES 70-virtual) #sm_70 = Volta, FP16 tensor cores
+                endif()
+            endif()
 
-            list(APPEND CMAKE_CUDA_ARCHITECTURES 75-virtual 80-virtual 86-real)
-
-            if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.8")
-                list(APPEND CMAKE_CUDA_ARCHITECTURES 89-real 90-virtual)
+            # Updateing... / MOL / TL;DR
+            if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "10.0") #sm_75 = Turing, int8 tensor cores
+                list(APPEND CMAKE_CUDA_ARCHITECTURES 75-virtual)
+                if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.0") #sm_80 = Ampere, asynchronous data loading, faster tensor core instructions
+                    list(APPEND CMAKE_CUDA_ARCHITECTURES 80-virtual)
+                endif()
+                if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.1") #sm_86 = RTX 3000
+                    list(APPEND CMAKE_CUDA_ARCHITECTURES 86-real)
+                endif()
+                if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.8") #sm_89 = RTX 4000
+                    list(APPEND CMAKE_CUDA_ARCHITECTURES 89-real)
+                    list(APPEND CMAKE_CUDA_ARCHITECTURES 90-virtual)
+                endif()
             endif()
 
             if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
@@ -133,7 +187,11 @@ if (CUDAToolkit_FOUND)
                             )
 
     if (GGML_CUDA_GRAPHS)
-        add_compile_definitions(GGML_CUDA_USE_GRAPHS)
+        if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "10.0")
+            add_compile_definitions(GGML_CUDA_USE_GRAPHS)
+        else()
+            message(WARNING "CUDA Graphs support requirements >= CUDA Toolkit 10.0")
+        endif()
     endif()
 
     if (GGML_CUDA_FORCE_MMQ)
@@ -146,6 +204,9 @@ if (CUDAToolkit_FOUND)
 
     if (GGML_CUDA_NO_VMM)
         add_compile_definitions(GGML_CUDA_NO_VMM)
+    elseif(CUDAToolkit_VERSION VERSION_LESS "10.2")
+        add_compile_definitions(GGML_CUDA_NO_VMM)
+        message(WARNING "CUDA Virtual Memory Management support requirements >= CUDA Toolkit 10.2")
     endif()
 
     if (NOT GGML_CUDA_FA)
@@ -191,75 +252,114 @@ if (CUDAToolkit_FOUND)
         endif()
     endif()
 
-    set(CUDA_CXX_FLAGS "")
-
-    set(CUDA_FLAGS -use_fast_math -extended-lambda)
-
-    if (GGML_CUDA_DEBUG)
-        list(APPEND CUDA_FLAGS -lineinfo)
-        add_compile_definitions(GGML_CUDA_DEBUG)
+    if (NOT DEFINED CUDA_CXX_FLAGS)
+        set(CUDA_CXX_FLAGS "")
     endif()
 
-    if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
-        # Options are:
-        # - none (not recommended)
-        # - speed (nvcc's default)
-        # - balance
-        # - size
-        list(APPEND CUDA_FLAGS -compress-mode=${GGML_CUDA_COMPRESSION_MODE})
-    endif()
+    if (${CMAKE_CUDA_COMPILER_ID} MATCHES "Clang")#LLVM-IR NVPTX
+        list(APPEND CUDA_CXX_FLAGS -Wno-unknown-cuda-version --no-cuda-version-check -D__NV_NO_HOST_COMPILER_CHECK=1 -Wno-all -Wno-extra)
+        if (NOT WIN32)
+            list(APPEND CUDA_CXX_FLAGS -fPIC)
+        endif()
+    else()#nvcc
+        #--compiler-options -fPIC # Explicitly set PIC flags for CUDA targets.
+        #-D_FORCE_INLINES # Fix for some combinations of CUDA and GCC (e.g. under Ubuntu 16.04).
+        #-Wno-deprecated-gpu-targets # Do not show warnings if the architectures are deprecated.
+        set(CUDA_FLAGS -w -use_fast_math -D_FORCE_INLINES -Wno-deprecated-gpu-targets)
+        if (CUDAToolkit_VERSION VERSION_EQUAL "7.0")
+            list(APPEND CUDA_FLAGS -relaxed-constexpr)
+            #list(APPEND CUDA_FLAGS --extended-lambda)#nvcc.exe v7.0 is closed
+        endif()
+        if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "7.5")#nvcc.exe v9.0 open -expt-extended-lambda actual effect
+            list(APPEND CUDA_FLAGS -expt-relaxed-constexpr -expt-extended-lambda)
+        endif()
+        if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "9.0")
+            list(APPEND CUDA_FLAGS -Wno-deprecated-declarations)# Do not show warnings if cuda library functions are deprecated.
+        endif()
+        if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "10.1.2" AND NOT APPLE)
+            list(APPEND CUDA_FLAGS -allow-unsupported-compiler)
+        endif()
+        list(APPEND CUDA_FLAGS -D__NV_NO_HOST_COMPILER_CHECK=1)# Some older versions of the CUDA Toolkit need to continue doing this to affect crt/host_config.h
 
-    if (GGML_FATAL_WARNINGS)
-        list(APPEND CUDA_FLAGS -Werror all-warnings)
-    endif()
-
-    if (GGML_ALL_WARNINGS AND NOT MSVC)
-        set(NVCC_CMD ${CMAKE_CUDA_COMPILER} .c)
-        if (NOT CMAKE_CUDA_HOST_COMPILER STREQUAL "")
-            list(APPEND NVCC_CMD -ccbin ${CMAKE_CUDA_HOST_COMPILER})
+        if (GGML_CUDA_DEBUG)
+            list(APPEND CUDA_FLAGS -lineinfo)
+            add_compile_definitions(GGML_CUDA_DEBUG)
         endif()
 
-        execute_process(
-            COMMAND ${NVCC_CMD} -Xcompiler --version
-            OUTPUT_VARIABLE CUDA_CCFULLVER
-            ERROR_QUIET
-        )
+        if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
+            # Options are:
+            # - none (not recommended)
+            # - speed (nvcc's default)
+            # - balance
+            # - size
+            list(APPEND CUDA_FLAGS -compress-mode=${GGML_CUDA_COMPRESSION_MODE})
+        endif()
 
-        if (NOT CUDA_CCFULLVER MATCHES clang)
-            set(CUDA_CCID "GNU")
-            execute_process(
-                COMMAND ${NVCC_CMD} -Xcompiler "-dumpfullversion -dumpversion"
-                OUTPUT_VARIABLE CUDA_CCVER
-                ERROR_QUIET
-                OUTPUT_STRIP_TRAILING_WHITESPACE
-            )
-        else()
-            if (CUDA_CCFULLVER MATCHES Apple)
-                set(CUDA_CCID "AppleClang")
-            else()
-                set(CUDA_CCID "Clang")
+        if (GGML_FATAL_WARNINGS)
+            list(APPEND CUDA_FLAGS -Werror all-warnings)
+        endif()
+
+        if (GGML_ALL_WARNINGS AND NOT MSVC)
+            set(NVCC_CMD ${CMAKE_CUDA_COMPILER} .c)
+            if (NOT CMAKE_CUDA_HOST_COMPILER STREQUAL "")
+                list(APPEND NVCC_CMD -ccbin ${CMAKE_CUDA_HOST_COMPILER})
             endif()
-            string(REGEX REPLACE "^.* version ([0-9.]*).*$" "\\1" CUDA_CCVER ${CUDA_CCFULLVER})
+
+            execute_process(
+                COMMAND ${NVCC_CMD} -Xcompiler --version
+                OUTPUT_VARIABLE CUDA_CCFULLVER
+                ERROR_QUIET
+            )
+
+            if (NOT CUDA_CCFULLVER MATCHES clang)
+                set(CUDA_CCID "GNU")
+                execute_process(
+                    COMMAND ${NVCC_CMD} -Xcompiler "-dumpfullversion -dumpversion"
+                    OUTPUT_VARIABLE CUDA_CCVER
+                    ERROR_QUIET
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                )
+            else()
+                if (CUDA_CCFULLVER MATCHES Apple)
+                    set(CUDA_CCID "AppleClang")
+                else()
+                    set(CUDA_CCID "Clang")
+                endif()
+                string(REGEX REPLACE "^.* version ([0-9.]*).*$" "\\1" CUDA_CCVER ${CUDA_CCFULLVER})
+            endif()
+
+            message(STATUS "CUDA host compiler is ${CUDA_CCID} ${CUDA_CCVER}")
+
+            ggml_get_flags(${CUDA_CCID} ${CUDA_CCVER})
+            list(APPEND CUDA_CXX_FLAGS ${CXX_FLAGS} ${GF_CXX_FLAGS})  # This is passed to -Xcompiler later
         endif()
 
-        message(STATUS "CUDA host compiler is ${CUDA_CCID} ${CUDA_CCVER}")
-
-        ggml_get_flags(${CUDA_CCID} ${CUDA_CCVER})
-        list(APPEND CUDA_CXX_FLAGS ${CXX_FLAGS} ${GF_CXX_FLAGS})  # This is passed to -Xcompiler later
-    endif()
-
-    if (NOT MSVC)
-        list(APPEND CUDA_CXX_FLAGS -Wno-pedantic)
-    else()
-        # CCCL 3.2 onwards will require a cpp-standard-compliant preprocessor for MSVC
-        # https://github.com/NVIDIA/cccl/pull/6827
-        list(APPEND CUDA_CXX_FLAGS /Zc:preprocessor)
+        if (NOT MSVC)
+            list(APPEND CUDA_CXX_FLAGS -Wno-pedantic)
+        else()
+            # CCCL 3.2 onwards will require a cpp-standard-compliant preprocessor for MSVC
+            # https://github.com/NVIDIA/cccl/pull/6827
+	    
+            #TODO _MSC_VER unknow
+            #list(APPEND CUDA_CXX_FLAGS /W0 /Gm- /EHsc- /D_HAS_EXCEPTIONS=0
+            #                           /GS- /Zi- /Z7-)# /FdNUL
+            # https://learn.microsoft.com/zh-cn/cpp/build/reference/zc-preprocessor?view=msvc-170
+            #if (_MSC_VER GREATER_EQUAL 1650)
+                list(APPEND CUDA_CXX_FLAGS /Zc:preprocessor)
+            #elseif(_MSC_VER GREATER_EQUAL 1580)
+            #    list(APPEND CUDA_CXX_FLAGS /experimental:preprocessor)
+            #endif()
+        endif()
     endif()
 
     list(JOIN   CUDA_CXX_FLAGS " " CUDA_CXX_FLAGS_JOINED)  # pass host compiler flags as a single argument
 
     if (NOT CUDA_CXX_FLAGS_JOINED STREQUAL "")
-        list(APPEND CUDA_FLAGS -Xcompiler ${CUDA_CXX_FLAGS_JOINED})
+        if (${CMAKE_CUDA_COMPILER_ID} MATCHES "NVIDIA")#nvcc
+            list(APPEND CUDA_FLAGS -Xcompiler ${CUDA_CXX_FLAGS_JOINED})
+        else()#Clang / PGI / HPC SDK ...
+            list(APPEND CUDA_FLAGS ${CUDA_CXX_FLAGS_JOINED})
+        endif()
     endif()
 
     target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")

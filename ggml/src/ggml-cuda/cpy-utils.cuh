@@ -29,7 +29,11 @@ static __device__ void quantize_f32_q4_0_block(const float * __restrict__ x, blo
     const float d  = vmax / -8;
     const float id = d ? 1.0f/d : 0.0f;
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     y->d = d;
+    #else
+    y->d = __float2half(d);
+    #endif
 
     for (int j = 0; j < QK4_0/2; ++j) {
         const float x0 = x[0       + j]*id;
@@ -56,8 +60,12 @@ static __device__ void quantize_f32_q4_1_block(const float * __restrict__ x, blo
     const float d  = (vmax - vmin) / ((1 << 4) - 1);
     const float id = d ? 1.0f/d : 0.0f;
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     y->dm.x = d;
     y->dm.y = vmin;
+    #else
+    y->dm.x = ((__float2half_rn(vmin) << 16) | (__float2half_rn(d) & 0xFFFF));
+    #endif // CUDART_VERSION > 8000
 
     for (int j = 0; j < QK4_1/2; ++j) {
         const float x0 = (x[0       + j] - vmin)*id;
@@ -86,7 +94,11 @@ static __device__ void quantize_f32_q5_0_block(const float * __restrict__ x, blo
     const float d  = vmax / -16;
     const float id = d ? 1.0f/d : 0.0f;
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     y->d = d;
+    #else
+    y->d = __float2half(d);
+    #endif
 
     uint32_t qh = 0;
     for (int j = 0; j < QK5_0/2; ++j) {
@@ -116,8 +128,12 @@ static __device__ void quantize_f32_q5_1_block(const float * __restrict__ x, blo
     const float d  = (max - min) / 31;
     const float id = d ? 1.0f/d : 0.0f;
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     y->dm.x = d;
     y->dm.y = min;
+    #else
+    y->dm.x = ((__float2half_rn(min) << 16) | (__float2half_rn(d) & 0xFFFF));
+    #endif // CUDART_VERSION > 8000
 
     uint32_t qh = 0;
     for (int j = 0; j < QK5_1/2; ++j) {
@@ -145,7 +161,11 @@ static __device__ void quantize_f32_q8_0_block(const float * __restrict__ x, blo
     const float d = amax / ((1 << 7) - 1);
     const float id = d ? 1.0f/d : 0.0f;
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     y->d = d;
+    #else
+    y->d = __float2half(d);
+    #endif
 
     for (int j = 0; j < QK8_0; ++j) {
         const float x0 = x[j]*id;
@@ -183,7 +203,11 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
         sumq2 += w0*v0*v0 + w1*v1*v1;
     }
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     y->d = sumq2 > 0 ? sumqx/sumq2 : d;
+    #else
+    y->d = __float2half(sumq2 > 0 ? sumqx/sumq2 : d);
+    #endif
 }
 
 // Wrapper functions for cpy.cu compatibility

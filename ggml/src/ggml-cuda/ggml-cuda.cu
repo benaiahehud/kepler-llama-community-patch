@@ -76,7 +76,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <charconv>
+//#include <charconv> unuse
 #include <cinttypes>
 #include <condition_variable>
 #include <cstddef>
@@ -369,7 +369,11 @@ static ggml_cuda_device_info ggml_cuda_init() {
                       id, prop.name, prop.major, prop.minor, device_vmm ? "yes" : "no",
                       device_vram_mib);
 #else
+        #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
         info.devices[id].smpbo = prop.sharedMemPerBlockOptin;
+        #else
+        info.devices[id].smpbo = prop.sharedMemPerBlock;
+        #endif
         info.devices[id].cc = 100*prop.major + 10*prop.minor;
         GGML_LOG_INFO("  Device %d: %s, compute capability %d.%d, VMM: %s, VRAM: %zu MiB\n",
                       id, prop.name, prop.major, prop.minor, device_vmm ? "yes" : "no",
@@ -1451,8 +1455,13 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
     static inline const cublasComputeType_t compute_type = CUBLAS_COMPUTE_16F;
     static inline const cudaDataType_t data_type = CUDA_R_16F;
     static inline const ggml_type ggml_type_val = GGML_TYPE_F16;
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     static inline const half alpha = 1.0;
     static inline const half beta = 0.0;
+    #else
+    static inline const half alpha = __float2half(1.0f);
+    static inline const half beta = __float2half(0.0f);
+    #endif
     static inline const void* get_alpha() { static const half val = alpha; return &val; }
     static inline const void* get_beta() { static const half val = beta; return &val; }
     static inline auto convert(ggml_type src_type) { return ggml_get_to_fp16_cuda(src_type); }
@@ -1561,11 +1570,12 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const void * beta = traits::get_beta();
 
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    // unconfirmed patch: FP32 FP16 BF16 priority?
     bool prefer_f32_output = false;
     if (compute_type == GGML_TYPE_F16) {
-        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
+        prefer_f32_output = cc == !fast_fp16_hardware_available(cc) || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
     } else if (compute_type == GGML_TYPE_BF16) {
-        prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
+        prefer_f32_output = (GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_AMPERE/*untest*/) || (GGML_CUDA_CC_IS_AMD(cc) && !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc)) || (GGML_CUDA_CC_IS_MTHREADS(cc) && cc < GGML_CUDA_CC_QY2);
     }
 
     if (prefer_f32_output) {
@@ -1841,7 +1851,7 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
-    if (const bool swapped = ggml_get_op_params_i32(glu, 1); swapped) {
+    if (ggml_get_op_params_i32(glu, 1)) { // swapped
         return false;
     }
 
@@ -4685,7 +4695,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             for (int i = 1; i <= concurrent_event->n_streams; ++i) {
                 cudaStream_t stream = cuda_ctx->stream(cuda_ctx->device, i);
-                CUDA_CHECK(cudaStreamWaitEvent(stream, concurrent_event->fork_event));
+                CUDA_CHECK(cudaStreamWaitEvent(stream, concurrent_event->fork_event, 0));
             }
         }
     };
@@ -4778,7 +4788,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             // Wait on join events of forked streams in the main stream
                             CUDA_CHECK(cudaEventRecord(concurrent_event->join_events[i - 1],
                                                        cuda_ctx->stream(cuda_ctx->device, i)));
-                            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), concurrent_event->join_events[i - 1]));
+                            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), concurrent_event->join_events[i - 1], 0));
                         }
 
                         is_concurrent_event_active = false;
@@ -4900,6 +4910,8 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 #endif // USE_CUDA_GRAPH
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+// unconfirmed patch: CUDA_GRAPH code scope?
+#ifdef USE_CUDA_GRAPH
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
@@ -4908,7 +4920,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
 
-#ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
@@ -4945,7 +4956,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
         }
     }
-#endif // USE_CUDA_GRAPH
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
@@ -4958,6 +4968,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+#endif // USE_CUDA_GRAPH
 
     return GGML_STATUS_SUCCESS;
 }

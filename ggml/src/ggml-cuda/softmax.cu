@@ -3,10 +3,16 @@
 #include "softmax.cuh"
 
 #ifdef GGML_USE_HIP
-#include <hip/hip_cooperative_groups.h>
-#else
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
+    #include <hip/hip_cooperative_groups.h>
+/*
+ptxas fatal   : Unresolved extern function 'cudaCGGetIntrinsicHandle'
+clang: error: ptxas command failed with exit code 2147483647 (use -v to see invocation)
+*/
+#elif __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL && CUDART_VERSION > 8000 && defined(__NVCC__)/* Visible to nvcc front-end only (cuda_device_runtime_api.h) */
+    #include <cooperative_groups.h>
+    #if CUDART_VERSION > 11000//unknow 'reduce' must min. ver.
+        #include <cooperative_groups/reduce.h>
+    #endif
 #endif // GGML_USE_HIP
 
 #include <cstdint>
@@ -150,9 +156,11 @@ static __device__ void soft_max_f32_parallelize_cols_single_row(const float * __
                                                                 float * shared_vals_max,
                                                                 float * shared_vals_sum,
                                                                 const soft_max_params p) {
+    #ifdef _CG_HAS_GRID_GROUP
     namespace cg = cooperative_groups;
 
     const cg::grid_group g = cg::this_grid();
+    #endif
 
     const int tid               = threadIdx.x;
     const int col_start         = blockIdx.x * blockDim.x + tid;
@@ -183,7 +191,9 @@ static __device__ void soft_max_f32_parallelize_cols_single_row(const float * __
     if (tid == 0) {
         tmp_maxs[blockIdx.x] = local_max;
     }
+    #ifdef _CG_HAS_GRID_GROUP
     g.sync();
+    #endif
 
     // Compute compute global max from CTA-level maxs
     assert(gridDim.x < blockDim.x);  // currently we only support this case
@@ -221,7 +231,9 @@ static __device__ void soft_max_f32_parallelize_cols_single_row(const float * __
     if (tid == 0) {
         tmp_sums[blockIdx.x] = tmp_expf;
     }
+    #ifdef _CG_HAS_GRID_GROUP
     g.sync();
+    #endif
 
     // Compute global sum from CTA-level sums
     if (tid < gridDim.x) {
@@ -349,6 +361,7 @@ static void soft_max_f32_cuda(const float *                                x,
     if (nbytes_shared <= smpbo) {
         launch_soft_max_kernels<32, 64, 128, 256, 512, 1024, 2048, 4096>(x, mask, sinks, dst, params, stream, block_dims, block_nums, nbytes_shared);
     } else {
+        #if defined(GGML_USE_HIP) || CUDART_VERSION > 8000
         // Parallelize across SMs for top-p/dist-sampling
         // The heuristic for parallelizing rows across SMs vs parallelizing single row & looping over all rows was done on the basis of a B6000 GPU and
         // Can be adapted further for lower-SM-count GPUs, though keeping data in registers should be implemented first as that is the optimal solution.
@@ -363,7 +376,9 @@ static void soft_max_f32_cuda(const float *                                x,
             CUDA_CHECK(cudaLaunchCooperativeKernel((void *) soft_max_f32_parallelize_cols,
                                                    dim3(ggml_cuda_info().devices[id].nsm, 1, 1),
                                                    dim3(WARP_SIZE * 8, 1, 1), kernel_args, 0, stream));
-        } else {
+        } else
+        #endif // defined(GGML_USE_HIP) || CUDART_VERSION > 8000
+        {
             const size_t nbytes_shared_low = WARP_SIZE * sizeof(float);
             soft_max_f32<false, 0, 0>
                 <<<block_nums, block_dims, nbytes_shared_low, stream>>>(x, mask, sinks, dst, params);

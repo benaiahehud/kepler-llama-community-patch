@@ -390,7 +390,7 @@ static void ggml_cuda_ar_wait_for_compute(
         ggml_cuda_ar_pipeline * p, ggml_backend_cuda_context * cuda_ctx, int rank, int slot) {
     ggml_cuda_ar_event_slot & ev = p->ev_pool[rank][slot];
     CUDA_CHECK(cudaEventRecord(ev.app, cuda_ctx->stream()));
-    CUDA_CHECK(cudaStreamWaitEvent(p->streams[rank], ev.app));
+    CUDA_CHECK(cudaStreamWaitEvent(p->streams[rank], ev.app, 0));
 }
 
 // ---------------------------------------------------------------------------
@@ -631,7 +631,7 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
         // No-op on the first AR -- no prior record exists.
         if (p->host_large_read_done_valid) {
             const int peer = 1 - i;
-            CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->host_large_read_done[peer]));
+            CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->host_large_read_done[peer], 0));
         }
 
         if (!compute[i]) {
@@ -665,7 +665,7 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
         // finish reading dev_tmp before our H2D overwrites it.  No-op on the
         // first copy_impl call.
         if (p->dev_tmp_kernel_done_valid) {
-            CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->dev_tmp_kernel_done[i]));
+            CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->dev_tmp_kernel_done[i], 0));
         }
 
         for (size_t c = 0; c < copy_chunks; ++c) {
@@ -673,7 +673,7 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
             const size_t this_bytes = (nbytes - offset) < chunk_bytes ?
                 (nbytes - offset) : chunk_bytes;
 
-            CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->ev_pool[peer][slot].cpy[c]));
+            CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->ev_pool[peer][slot].cpy[c], 0));
             CUDA_CHECK(cudaMemcpyAsync(
                 p->dev_tmp[i] + offset, p->host_large[peer].host + offset, this_bytes,
                 cudaMemcpyHostToDevice, p->streams[i]));
@@ -686,7 +686,7 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
         // Hand off from AR stream (copy engine) to compute stream: compute
         // stream waits for all H2Ds to finish, then runs the add_kernel.
         CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].h2d, p->streams[i]));
-        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx[i]->stream(), p->ev_pool[i][slot].h2d));
+        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx[i]->stream(), p->ev_pool[i][slot].h2d, 0));
 
         const int block_size = 256;
         int n_blocks = (int) ((ne + block_size - 1) / block_size);

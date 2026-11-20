@@ -4,7 +4,11 @@
 static __device__ __forceinline__ void dequantize_q1_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q1_0 * x = (const block_q1_0 *) vx;
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float d = x[ib].d;
+    #else
+    const float d = __half2float(x[ib].d);
+    #endif
 
     const int bit_index_0 = iqs;
     const int bit_index_1 = iqs + 1;
@@ -26,7 +30,11 @@ static __device__ __forceinline__ void dequantize_q1_0(const void * vx, const in
 static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q2_0 * x = (const block_q2_0 *) vx;
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float d = x[ib].d;
+    #else
+    const float d = __half2float(x[ib].d);
+    #endif
 
     // Q2_0: 2 bits per element, 4 elements per byte.
     // Stored code c in {0,1,2,3} maps to symbol s = c - 1 in {-1, 0, +1, +2}.
@@ -46,7 +54,11 @@ static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const in
 static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q4_0 * x = (const block_q4_0 *) vx;
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float d = x[ib].d;
+    #else
+    const float d = __half2float(x[ib].d);
+    #endif
 
     const int vui = x[ib].qs[iqs];
 
@@ -74,7 +86,11 @@ static __device__ __forceinline__ void dequantize_q4_1(const void * vx, const in
 static __device__ __forceinline__ void dequantize_q5_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q5_0 * x = (const block_q5_0 *) vx;
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float d = x[ib].d;
+    #else
+    const float d = __half2float(x[ib].d);
+    #endif
 
     uint32_t qh;
     memcpy(&qh, x[ib].qh, sizeof(qh));
@@ -110,7 +126,11 @@ static __device__ __forceinline__ void dequantize_q5_1(const void * vx, const in
 static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q8_0 * x = (const block_q8_0 *) vx;
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float d = x[ib].d;
+    #else
+    const float d = __half2float(x[ib].d);
+    #endif
 
     v.x = x[ib].qs[iqs + 0];
     v.y = x[ib].qs[iqs + 1];
@@ -135,8 +155,13 @@ static __device__ __forceinline__ void dequantize_q2_K(const void * vx, const in
     const uint8_t q = x[ib].qs[32*n + l];
     dst_t * y = yy + 128*n;
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     float dall = __low2half(x[ib].dm);
     float dmin = __high2half(x[ib].dm);
+    #else
+    float dall = __half2float(__low2half(x[ib].dm));
+    float dmin = __half2float(__high2half(x[ib].dm));
+    #endif
     y[l+ 0] = ggml_cuda_cast<dst_t>(dall * (x[ib].scales[is+0] & 0xF) * ((q >> 0) & 3) - dmin * (x[ib].scales[is+0] >> 4));
     y[l+32] = ggml_cuda_cast<dst_t>(dall * (x[ib].scales[is+2] & 0xF) * ((q >> 2) & 3) - dmin * (x[ib].scales[is+2] >> 4));
     y[l+64] = ggml_cuda_cast<dst_t>(dall * (x[ib].scales[is+4] & 0xF) * ((q >> 4) & 3) - dmin * (x[ib].scales[is+4] >> 4));
@@ -162,7 +187,11 @@ static __device__ __forceinline__ void dequantize_q3_K(const void * vx, const in
                 is <  8 ? (x[ib].scales[is-0] & 0xF) | (((x[ib].scales[is+4] >> 2) & 3) << 4) :
                 is < 12 ? (x[ib].scales[is-8] >>  4) | (((x[ib].scales[is+0] >> 4) & 3) << 4) :
                           (x[ib].scales[is-8] >>  4) | (((x[ib].scales[is-4] >> 6) & 3) << 4);
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     float d_all = x[ib].d;
+    #else
+    float d_all = __half2float(x[ib].d);
+    #endif
     float dl = d_all * (us - 32);
 
     dst_t * y = yy + 128*n + 32*j;
@@ -195,8 +224,13 @@ static __device__ __forceinline__ void dequantize_q4_K(const void * vx, const in
 
     dst_t * y = yy + 64*il + n*ir;
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float dall = __low2half(x[ib].dm);
     const float dmin = __high2half(x[ib].dm);
+    #else
+    const float dall = __half2float(__low2half(x[ib].dm));
+    const float dmin = __half2float(__high2half(x[ib].dm));
+    #endif
 
     const uint8_t * q = x[ib].qs + 32*il + n*ir;
 
@@ -222,8 +256,13 @@ static __device__ __forceinline__ void dequantize_q5_K(const void * vx, const in
 
     dst_t * y = yy + 64*il + 2*ir;
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float dall = __low2half(x[ib].dm);
     const float dmin = __high2half(x[ib].dm);
+    #else
+    const float dall = __half2float(__low2half(x[ib].dm));
+    const float dmin = __half2float(__high2half(x[ib].dm));
+    #endif
 
     const uint8_t * ql = x[ib].qs + 32*il + 2*ir;
     const uint8_t * qh = x[ib].qh + 2*ir;
@@ -253,7 +292,11 @@ static __device__ __forceinline__ void dequantize_q6_K(const void * vx, const in
 
     dst_t * y = yy + 128*ip + il;
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float d = x[ib].d;
+    #else
+    const float d = __half2float(x[ib].d);
+    #endif
 
     const uint8_t * ql = x[ib].ql + 64*ip + il;
     const uint8_t   qh = x[ib].qh[32*ip + il];
@@ -282,7 +325,11 @@ static __device__ __forceinline__ void dequantize_iq2_xxs(const void * vx, const
     const uint8_t  * aux8 = (const uint8_t *)q2;
     const uint8_t  * grid = (const uint8_t *)(iq2xxs_grid + aux8[il]);
     const uint32_t aux32 = q2[2] | (q2[3] << 16);
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float d = (float)x[ibs].d * (0.5f + (aux32 >> 28)) * 0.25f;
+    #else
+    const float d = __half2float(x[ibs].d) * (0.5f + (aux32 >> 28)) * 0.25f;
+    #endif
     const uint8_t signs = ksigns_iq2xs[(aux32 >> 7*il) & 127];
     for (int j = 0; j < 8; ++j) {
         y[j] = ggml_cuda_cast<dst_t>(d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f));
@@ -299,7 +346,11 @@ static __device__ __forceinline__ void dequantize_iq2_xs(const void * vx, const 
     dst_t * y = yy + 32*ib + 8*il;
     const uint16_t * q2 = x[ibs].qs + 4*ib;
     const uint8_t  * grid = (const uint8_t *)(iq2xs_grid + (q2[il] & 511));
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float d = (float)x[ibs].d * (0.5f + ((x[ibs].scales[ib] >> 4*(il/2)) & 0xf)) * 0.25f;
+    #else
+    const float d = __half2float(x[ibs].d) * (0.5f + ((x[ibs].scales[ib] >> 4*(il/2)) & 0xf)) * 0.25f;
+    #endif
     const uint8_t signs = ksigns_iq2xs[q2[il] >> 9];
     for (int j = 0; j < 8; ++j) {
         y[j] = ggml_cuda_cast<dst_t>(d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f));
@@ -315,7 +366,11 @@ static __device__ __forceinline__ void dequantize_iq2_s(const void * vx, const i
     const int64_t ib = tid%8; // 0...7
     dst_t * y = yy + 32*ib + 8*il;
     const uint8_t * grid = (const uint8_t *)(iq2s_grid + (x[ibs].qs[4*ib+il] | ((x[ibs].qh[ib] << (8-2*il)) & 0x300)));
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float d = (float)x[ibs].d * (0.5f + ((x[ibs].scales[ib] >> 4*(il/2)) & 0xf)) * 0.25f;
+    #else
+    const float d = __half2float(x[ibs].d) * (0.5f + ((x[ibs].scales[ib] >> 4*(il/2)) & 0xf)) * 0.25f;
+    #endif
     const uint8_t signs = x[ibs].qs[QK_K/8+4*ib+il];
     for (int j = 0; j < 8; ++j) {
         y[j] = ggml_cuda_cast<dst_t>(d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f));
@@ -335,7 +390,11 @@ static __device__ __forceinline__ void dequantize_iq3_xxs(const void * vx, const
     const uint8_t  * grid1 = (const uint8_t *)(iq3xxs_grid + q3[2*il+0]);
     const uint8_t  * grid2 = (const uint8_t *)(iq3xxs_grid + q3[2*il+1]);
     const uint32_t aux32 = gas[0] | (gas[1] << 16);
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float d = (float)x[ibs].d * (0.5f + (aux32 >> 28)) * 0.5f;
+    #else
+    const float d = __half2float(x[ibs].d) * (0.5f + (aux32 >> 28)) * 0.5f;
+    #endif
     const uint8_t signs = ksigns_iq2xs[(aux32 >> 7*il) & 127];
     for (int j = 0; j < 4; ++j) {
         y[j+0] = ggml_cuda_cast<dst_t>(d * grid1[j] * (signs & kmask_iq2xs[j+0] ? -1.f : 1.f));
@@ -354,7 +413,11 @@ static __device__ __forceinline__ void dequantize_iq3_s(const void * vx, const i
     const uint8_t * qs = x[ibs].qs + 8*ib;
     const uint8_t * grid1 = (const uint8_t *)(iq3s_grid + (qs[2*il+0] | ((x[ibs].qh[ib] << (8-2*il)) & 256)));
     const uint8_t * grid2 = (const uint8_t *)(iq3s_grid + (qs[2*il+1] | ((x[ibs].qh[ib] << (7-2*il)) & 256)));
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float d = (float)x[ibs].d * (1 + 2*((x[ibs].scales[ib/2] >> 4*(ib%2)) & 0xf));
+    #else
+    const float d = __half2float(x[ibs].d) * (1 + 2*((x[ibs].scales[ib/2] >> 4*(ib%2)) & 0xf));
+    #endif
     const uint8_t signs = x[ibs].signs[4*ib + il];
     for (int j = 0; j < 4; ++j) {
         y[j+0] = ggml_cuda_cast<dst_t>(d * grid1[j] * (signs & kmask_iq2xs[j+0] ? -1.f : 1.f));
@@ -371,7 +434,11 @@ static __device__ __forceinline__ void dequantize_iq1_s(const void * vx, const i
     const int64_t ib = tid%8; // 0...7
     dst_t * y = yy + 32*ib + 8*il;
     const float delta = x[ibs].qh[ib] & 0x8000 ? -1 - IQ1S_DELTA : -1 + IQ1S_DELTA;
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float d = (float)x[ibs].d * (2*((x[ibs].qh[ib] >> 12) & 7) + 1);
+    #else
+    const float d = __half2float(x[ibs].d) * (2*((x[ibs].qh[ib] >> 12) & 7) + 1);
+    #endif
     uint32_t grid32[2]; const int8_t * q = (const int8_t *)grid32;
     grid32[0] = iq1s_grid_gpu[x[ibs].qs[4*ib+il] | (((x[ibs].qh[ib] >> 3*il) & 7) << 8)];
     grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
@@ -393,7 +460,11 @@ static __device__ __forceinline__ void dequantize_iq1_m(const void * vx, const i
     iq1m_scale_t scale;
     scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
     const int64_t ib16 = 2*ib + il/2; // sc[ib16/4] >> 3*(ib16%4) -> sc[ib/2] >> 3*((2*ib+il/2)%4);
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float d = (float)scale.f16 * (2*((sc[ib16/4] >> 3*(ib16%4)) & 0x7) + 1);
+    #else
+    const float d = __half2float(scale.f16) * (2*((sc[ib16/4] >> 3*(ib16%4)) & 0x7) + 1);
+    #endif
     const float delta = x[ibs].qh[2*ib+il/2] & (0x08 << 4*(il%2)) ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA;
     uint32_t grid32[2]; const int8_t * q = (const int8_t *)grid32;
     grid32[0] = iq1s_grid_gpu[x[ibs].qs[4*ib+il] | (((x[ibs].qh[2*ib+il/2] >> 4*(il%2)) & 7) << 8)];
@@ -413,7 +484,11 @@ static __device__ __forceinline__ void dequantize_iq4_nl(const void * vx, const 
     const int64_t ib = tid%8; // 0...7
     dst_t * y = yy + 32*ib + 4*il;
     const uint8_t  * q4 = x[ib].qs + 4*il;
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float d = (float)x[ib].d;
+    #else
+    const float d = __half2float(x[ib].d);
+    #endif
     for (int j = 0; j < 4; ++j) {
         y[j+ 0] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] & 0xf]);
         y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] >>  4]);
@@ -428,7 +503,11 @@ static __device__ __forceinline__ void dequantize_iq4_xs(const void * vx, const 
     const int64_t ib = tid%8; // 0...7
     dst_t * y = yy + 32*ib + 4*il;
     const uint8_t  * q4 = x[ibs].qs + 16*ib + 4*il;
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float d = (float)x[ibs].d * ((((x[ibs].scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((x[ibs].scales_h >> 2*ib) & 3) << 4)) - 32);
+    #else
+    const float d = __half2float(x[ibs].d) * ((((x[ibs].scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((x[ibs].scales_h >> 2*ib) & 3) << 4)) - 32);
+    #endif
     for (int j = 0; j < 4; ++j) {
         y[j+ 0] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] & 0xf]);
         y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] >>  4]);

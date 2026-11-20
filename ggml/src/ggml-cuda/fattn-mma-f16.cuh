@@ -2054,7 +2054,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     bool use_sparse = false;
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if CUDART_VERSION > 8000 || (!defined(CUDART_VERSION) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA))
         if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2)) {
             if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, ncols1, ncols2)) {
                 constexpr bool use_sparse_kernel = true;

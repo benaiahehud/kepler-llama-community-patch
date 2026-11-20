@@ -690,7 +690,11 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     // Q8_1: 32 elements per block with individual scales
     // iqs selects which of the 4 chunks of 32 elements to process (0-3)
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float     d1 = bq1_0->d;
+    #else
+    const float     d1 = __half2float(bq1_0->d);
+    #endif
     const int16_t * qs = (const int16_t *) bq1_0->qs + iqs * 2;
 
     // Process only the chunk specified by iqs
@@ -760,7 +764,11 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     // Q8_1: 32 elements per block with individual scales
     // iqs selects which of the 2 chunks of 32 elements to process (0-1)
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float     d2 = bq2_0->d;
+    #else
+    const float     d2 = __half2float(bq2_0->d);
+    #endif
     const int16_t * qs = (const int16_t *) bq2_0->qs + iqs * 4;
 
     // Process only the chunk specified by iqs
@@ -812,7 +820,11 @@ static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
         u[2*i+1] = get_int_b4(bq8_1->qs, iqs + i + QI4_0);
     }
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     return vec_dot_q4_0_q8_1_impl<VDR_Q4_0_Q8_1_MMVQ>(v, u, bq4_0->d, bq8_1->ds);
+    #else
+    return vec_dot_q4_0_q8_1_impl<VDR_Q4_0_Q8_1_MMVQ>(v, u, __half2float(bq4_0->d), bq8_1->ds);
+    #endif
 }
 
 
@@ -851,7 +863,11 @@ static __device__ __forceinline__ float vec_dot_q5_0_q8_1(
         u[2*i+1] = get_int_b4(bq8_1->qs, iqs + i + QI5_0);
     }
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     return vec_dot_q5_0_q8_1_impl<VDR_Q5_0_Q8_1_MMVQ>(vl, vh, u, bq5_0->d, bq8_1->ds);
+    #else
+    return vec_dot_q5_0_q8_1_impl<VDR_Q5_0_Q8_1_MMVQ>(vl, vh, u, __half2float(bq5_0->d), bq8_1->ds);
+    #endif
 }
 
 static __device__ __forceinline__ float vec_dot_q5_1_q8_1(
@@ -888,7 +904,11 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
         u[i] = get_int_b4(bq8_1->qs, iqs + i);
     }
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, bq8_0->d, __low2half(bq8_1->ds));
+    #else
+    return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, __half2float(bq8_0->d), __half2float(__low2half(bq8_1->ds)));
+    #endif
 }
 
 static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
@@ -936,7 +956,11 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
     const int bq8_offset = QR3_K * (iqs / (QI3_K/2));
     const int iqs8 = iqs % QI8_1;
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float d = bq3_K->d;
+    #else
+    const float d = __half2float(bq3_K->d);
+    #endif
 
     int vl[VDR_Q3_K_Q8_1_MMVQ];
     int vh[VDR_Q3_K_Q8_1_MMVQ];
@@ -1102,7 +1126,11 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
         d8[i] = __low2float(bq8_1[bq8_offset + 2*i].ds);
     }
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+    #else
+    return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, __half2float(bq6_K->d), d8);
+    #endif
 }
 
 #define VDR_IQ2_XXS_Q8_1_MMVQ 2

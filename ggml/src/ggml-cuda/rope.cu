@@ -98,7 +98,11 @@ static __global__ void rope_norm(const T *            x,
         if (inplace) {
             return;
         }
+        #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
         store_coaelsced(x[ix + 0], x[ix + 1]);
+        #else
+        store_coaelsced(__half2float(x[ix + 0]), __half2float(x[ix + 1]));
+        #endif
         return;
     }
 
@@ -113,10 +117,17 @@ static __global__ void rope_norm(const T *            x,
 
     rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, iw, ext_factor, attn_factor, cos_theta, sin_theta);
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float x0 = x[ix + 0];
     const float x1 = x[ix + 1];
 
     store_coaelsced(x0 * cos_theta - x1 * sin_theta, x0 * sin_theta + x1 * cos_theta);
+    #else
+    const float x0 = __half2float(x[ix + 0]);
+    const float x1 = __half2float(x[ix + 1]);
+
+    store_coaelsced(__half2float(x0 * cos_theta - x1 * sin_theta), __half2float(x0 * sin_theta + x1 * cos_theta));
+    #endif
 }
 
 template <bool forward, bool has_ff, typename T, typename D>
@@ -189,8 +200,13 @@ static __global__ void rope_neox(const T *            x,
     rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, iw, ext_factor, attn_factor, cos_theta, sin_theta);
 
     // idst/ix point at channel i0/2; the first channel of the rotated pair is n_offs + iw/2 = i0/2 + n_offs/2
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float x0 = x[ix + n_offs/2 + 0];
     const float x1 = x[ix + n_offs/2 + n_dims/2];
+    #else
+    const float x0 = __half2float(x[ix + n_offs/2 + 0]);
+    const float x1 = __half2float(x[ix + n_offs/2 + n_dims/2]);
+    #endif
 
     dst[idst + n_offs/2 + 0]          = ggml_cuda_cast<D>(x0 * cos_theta - x1 * sin_theta);
     dst[idst + n_offs/2 + n_dims / 2] = ggml_cuda_cast<D>(x0 * sin_theta + x1 * cos_theta);
@@ -357,11 +373,19 @@ static __global__ void rope_vision(const T *            x,
 
     rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta, sin_theta);
 
+    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
     const float x0 = x[ix + 0];
     const float x1 = x[ix + n_dims];
 
     dst[idst + 0]      = x0*cos_theta - x1*sin_theta;
     dst[idst + n_dims] = x0*sin_theta + x1*cos_theta;
+    #else
+    const float x0 = __half2float(x[ix + 0]);
+    const float x1 = __half2float(x[ix + n_dims]);
+
+    dst[idst + 0]      = ggml_cuda_cast<T>(x0*cos_theta - x1*sin_theta);
+    dst[idst + n_dims] = ggml_cuda_cast<T>(x0*sin_theta + x1*cos_theta);
+    #endif
 }
 
 template <bool forward, typename T, typename D>

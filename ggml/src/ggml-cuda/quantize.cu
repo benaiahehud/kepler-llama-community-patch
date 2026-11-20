@@ -538,10 +538,17 @@ static __global__ void quantize_mmq_q8_1(
 
         if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
             if (iqs % 16 == 0 && iqs < 96) {
+                #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
                 y[ib].d2s6[2 + iqs/16] = sum;
                 if (iqs % 64 == 0) {
                     y[ib].d2s6[iqs/64] = d;
                 }
+                #else
+                y[ib].d2s6[2 + iqs/16] = __float2half(sum);
+                if (iqs % 64 == 0) {
+                    y[ib].d2s6[iqs/64] = __float2half(d);
+                }
+                #endif
             }
         } else if (iqs % 32 == 0) {
             if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {

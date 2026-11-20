@@ -1,4 +1,5 @@
 #include "clamp.cuh"
+#include "convert.cuh" // #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
 
 static __device__ __forceinline__ float op_clamp(float x, float min, float max) {
     return fminf(fmaxf(x, min), max);

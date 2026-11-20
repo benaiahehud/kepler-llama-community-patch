@@ -430,7 +430,11 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 
+    #if (CUDART_VERSION > 8000 && defined(__CUDA_ARCH__)) || !defined(CUDART_VERSION)
     auto load = [&] __device__ (const int n) {
+    #else
+    auto load = [&] (const int n) {
+    #endif
         const int stride_j = warp_size >> n;
 
         if (stride_j == 0) {
@@ -454,7 +458,11 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
                 for (int j0 = j0_start; j0 < j0_stop; j0 += stride_j) {
                     const int j = j0*(cpy_ne/2) + (stride_j == warp_size ? threadIdx.x : threadIdx.x % stride_j)*(cpy_ne/2);
 
+                    #if CUDART_VERSION > 8000 || !defined(CUDART_VERSION)
                     const half2 zero[cpy_ne/2] = {{0.0f, 0.0f}};
+                    #else
+                    const half2 zero[cpy_ne/2] = {__floats2half2_rn(0.0f, 0.0f)};
+                    #endif
                     __align__(16) half2 tmp_h2[cpy_ne/2];
                     ggml_cuda_memcpy_1<sizeof(tmp_h2)>(
                         tmp_h2, !oob_check || i < i_sup ? KV + i*stride_KV + j : zero);
