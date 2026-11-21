@@ -3192,6 +3192,40 @@ static bool ggml_cuda_kepler_mmv_enabled() {
 
 static_assert(sizeof(block_iq3_xxs) == 98, "unexpected block_iq3_xxs size");
 
+// One lane's 8 weights (sub-block ib32, group l) of one IQ3_XXS block times y, scaled: returns dot8 * db.
+// All fields are 2-byte aligned in the 98-byte block, so only 16-bit loads (never widen these).
+static __device__ __forceinline__ float iq3_xxs_sb_dot8(
+        const char * block, const int ib32, const int l, const float4 * grid_f4, const float4 y1, const float4 y2) {
+    const uint16_t * halfwords = reinterpret_cast<const uint16_t *>(block);
+    const uint16_t q = halfwords[1 + 4 * ib32 + l];
+    const uint32_t aux = static_cast<uint32_t>(halfwords[33 + 2 * ib32])
+        | (static_cast<uint32_t>(halfwords[34 + 2 * ib32]) << 16);
+    half d_h;
+    memcpy(&d_h, halfwords, sizeof(d_h));
+    const float db = __half2float(d_h) * (0.5f + static_cast<float>(aux >> 28)) * 0.5f;
+    // sign byte = 7-bit index plus even parity in bit 7 (equals ksigns_iq2xs for all 128 values: probe)
+    const uint32_t s7 = (aux >> (7 * l)) & 127u;
+    const uint32_t signs = s7 | ((__popc(s7) & 1u) << 7);
+    const float4 g1 = grid_f4[q & 0xffu];
+    const float4 g2 = grid_f4[q >> 8];
+    // sign j applied by XOR into the float sign bit; s holds sign bit 7 at bit 31 and doubling it (IADD,
+    // 160/clk) brings the next lower sign bit to bit 31, instead of one 32/clk shift per weight
+    uint32_t s = signs << 24;
+    float dot = 0.0f;
+#define IQ3_SIGNED(g) __uint_as_float(__float_as_uint(g) ^ (s & 0x80000000u))
+    dot = fmaf(IQ3_SIGNED(g2.w), y2.w, dot); s += s;
+    dot = fmaf(IQ3_SIGNED(g2.z), y2.z, dot); s += s;
+    dot = fmaf(IQ3_SIGNED(g2.y), y2.y, dot); s += s;
+    dot = fmaf(IQ3_SIGNED(g2.x), y2.x, dot); s += s;
+    dot = fmaf(IQ3_SIGNED(g1.w), y1.w, dot); s += s;
+    dot = fmaf(IQ3_SIGNED(g1.z), y1.z, dot); s += s;
+    dot = fmaf(IQ3_SIGNED(g1.y), y1.y, dot); s += s;
+    dot = fmaf(IQ3_SIGNED(g1.x), y1.x, dot);
+#undef IQ3_SIGNED
+    return dot * db;
+}
+
+template <int RPW>   // rows per warp
 __launch_bounds__(128)
 static __global__ void mul_mat_vec_iq3_xxs_kepler_sb(
         const char * __restrict__ vx,
@@ -3211,70 +3245,66 @@ static __global__ void mul_mat_vec_iq3_xxs_kepler_sb(
     // grid table in shared memory. Staged with explicit indices: a `for (i = tid; i < 256; i += 128)` loop is
     // miscompiled by this toolchain (clang-22 + ptxas 10.2, sm_30: the remainder trip count comes out as
     // `ISUB R, R4, R4` = 0, so entries 128..255 were never written; probe: iq3-table-probe.cu, 2026-11-21).
-    __shared__ uint32_t grid_s[256];
+    // r16 (Neon review): the table is pre-expanded to float4 (4 KB) so the inner loop does no byte decode.
+    __shared__ float4 grid_f4[256];
     {
-        const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;   // blockDim = (32, 4)
-        grid_s[tid]       = iq3xxs_grid[tid];
-        grid_s[tid + 128] = iq3xxs_grid[tid + 128];
+        const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;   // blockDim = (32, 4): launcher asserts it
+        const uint32_t g0 = iq3xxs_grid[tid];
+        const uint32_t g1 = iq3xxs_grid[tid + 128];
+        grid_f4[tid]       = make_float4((float) (g0 & 0xffu), (float) ((g0 >> 8) & 0xffu), (float) ((g0 >> 16) & 0xffu), (float) (g0 >> 24));
+        grid_f4[tid + 128] = make_float4((float) (g1 & 0xffu), (float) ((g1 >> 8) & 0xffu), (float) ((g1 >> 16) & 0xffu), (float) (g1 >> 24));
     }
     __syncthreads();
 
     const int lane = threadIdx.x;
     const int ib32 = lane >> 2;
     const int l = lane & 3;
-    const int row = blockIdx.x * 4 + threadIdx.y;
+    // r16 (Grok/Muse review): two rows per warp, same lane map; each y float4 pair is loaded once and used by
+    // both rows, and the two rows' FMA chains are independent (the kernel was latency-bound, not decode-bound:
+    // removing the byte decode alone gave 0%).
+    const int row0 = blockIdx.x * (RPW * 4) + threadIdx.y * RPW;
     const uint32_t channel_x = fastdiv(blockIdx.y, channel_ratio);
     const uint32_t sample_x = fastdiv(blockIdx.z, sample_ratio);
     const char * x_base = vx + sample_x * stride_sample_x * sizeof(block_iq3_xxs)
         + channel_x * stride_channel_x * sizeof(block_iq3_xxs);
     const float * y_base = vy + blockIdx.z * stride_sample_y + blockIdx.y * stride_channel_y;
-    float acc = 0.0f;
+    float acc[RPW];
+    const char * row_x[RPW];
+    const int64_t row_bytes = stride_row_x * static_cast<int64_t>(sizeof(block_iq3_xxs));
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        acc[r] = 0.0f;
+        // rows past the end read row0 (valid memory) and are never stored
+        row_x[r] = x_base + static_cast<int64_t>(row0 + (row0 + r < nrows ? r : 0)) * row_bytes;
+    }
 
-    if (row < nrows) {
-        const char * row_x = x_base + row * stride_row_x * sizeof(block_iq3_xxs);
+    if (row0 < nrows) {   // warp-uniform
         for (int b = 0; b < nb; ++b) {
-            const char * block = row_x + b * sizeof(block_iq3_xxs);
-            const uint16_t * halfwords = reinterpret_cast<const uint16_t *>(block);
-            const uint16_t q = halfwords[1 + 4 * ib32 + l];
-            const uint32_t aux = static_cast<uint32_t>(halfwords[33 + 2 * ib32])
-                | (static_cast<uint32_t>(halfwords[34 + 2 * ib32]) << 16);
-            half d_h;
-            memcpy(&d_h, halfwords, sizeof(d_h));
-            const float d = __half2float(d_h);
-            const float db = d * (0.5f + static_cast<float>(aux >> 28)) * 0.5f;
-            // sign byte = 7-bit index plus even parity in bit 7 (equals ksigns_iq2xs for all 128 values: probe)
-            const uint32_t s7 = (aux >> (7 * l)) & 127u;
-            const uint32_t signs = s7 | ((__popc(s7) & 1u) << 7);
-            const uint32_t g1 = grid_s[q & 0xffu];
-            const uint32_t g2 = grid_s[q >> 8];
             const int y_index = b * QK_K + 32 * ib32 + 8 * l;
             const float4 y1 = *reinterpret_cast<const float4 *>(y_base + y_index);
             const float4 y2 = *reinterpret_cast<const float4 *>(y_base + y_index + 4);
-            // grid bytes -> floats with the magic-number trick; sign j applied by XOR into the float sign bit
-            uint32_t u;
-            float dot = 0.0f;
-            asm("or.b32 %0, %1, 0xff000000;" : "=r"(u) : "r"(g1));
-            dot = fmaf(__uint_as_float(__float_as_uint(__fadd_rn(__uint_as_float(u & 0x4B0000FFu), -8388608.0f)) ^ ((signs << 31) & 0x80000000u)), y1.x, dot);
-            dot = fmaf(__uint_as_float(__float_as_uint(__fadd_rn(__uint_as_float(u & 0x4700FF00u), -32768.0f)) ^ ((signs << 30) & 0x80000000u)), y1.y, dot);
-            asm("or.b32 %0, %1, 0xff000000;" : "=r"(u) : "r"(g1 >> 16));
-            dot = fmaf(__uint_as_float(__float_as_uint(__fadd_rn(__uint_as_float(u & 0x4B0000FFu), -8388608.0f)) ^ ((signs << 29) & 0x80000000u)), y1.z, dot);
-            dot = fmaf(__uint_as_float(__float_as_uint(__fadd_rn(__uint_as_float(u & 0x4700FF00u), -32768.0f)) ^ ((signs << 28) & 0x80000000u)), y1.w, dot);
-            asm("or.b32 %0, %1, 0xff000000;" : "=r"(u) : "r"(g2));
-            dot = fmaf(__uint_as_float(__float_as_uint(__fadd_rn(__uint_as_float(u & 0x4B0000FFu), -8388608.0f)) ^ ((signs << 27) & 0x80000000u)), y2.x, dot);
-            dot = fmaf(__uint_as_float(__float_as_uint(__fadd_rn(__uint_as_float(u & 0x4700FF00u), -32768.0f)) ^ ((signs << 26) & 0x80000000u)), y2.y, dot);
-            asm("or.b32 %0, %1, 0xff000000;" : "=r"(u) : "r"(g2 >> 16));
-            dot = fmaf(__uint_as_float(__float_as_uint(__fadd_rn(__uint_as_float(u & 0x4B0000FFu), -8388608.0f)) ^ ((signs << 25) & 0x80000000u)), y2.z, dot);
-            dot = fmaf(__uint_as_float(__float_as_uint(__fadd_rn(__uint_as_float(u & 0x4700FF00u), -32768.0f)) ^ ((signs << 24) & 0x80000000u)), y2.w, dot);
-            acc = fmaf(dot, db, acc);
+#pragma unroll
+            for (int r = 0; r < RPW; ++r) {
+                acc[r] += iq3_xxs_sb_dot8(row_x[r] + b * sizeof(block_iq3_xxs), ib32, l, grid_f4, y1, y2);
+            }
         }
     }
 
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        acc += __shfl_down(acc, offset);
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            acc[r] += __shfl_down_sync(0xffffffffu, acc[r], offset);
+        }
     }
-    if (lane == 0 && row < nrows) {
+    if (lane == 0) {
         float * dst_base = dst + blockIdx.z * stride_sample_dst + blockIdx.y * stride_channel_dst;
-        dst_base[row] = acc;
+#pragma unroll
+        for (int r = 0; r < RPW; ++r) {
+            if (row0 + r < nrows) {
+                dst_base[row0 + r] = acc[r];
+            }
+        }
     }
 }
 
@@ -3284,12 +3314,23 @@ static void launch_mmvk_iq3_xxs_sb(
         const uint3 channel_ratio, const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
         const uint3 sample_ratio, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
         const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
-    constexpr int ROWS_PER_BLOCK = 4;
-    const dim3 block_nums(static_cast<unsigned int>((nrows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
+    constexpr int WARPS_PER_BLOCK = 4;   // the kernel's grid staging assumes exactly 128 threads (32 x 4)
+    static_assert(WARPS_PER_BLOCK * WARP_SIZE == 128, "iq3_xxs sb stages its table with 128 threads");
+    // rows per warp: GGML_CUDA_KEPLER_MMV_IQ3_RPW = 1, 2 or 4 forces it; default 4, but 1 for short matrices
+    // (r16: 16x2048 takes 25 us at 1 row per warp vs 45 us at 4, which leaves the card one thread block)
+    static const int rpw_env = []() {
+        const char * env = std::getenv("GGML_CUDA_KEPLER_MMV_IQ3_RPW");
+        const int v = env ? std::atoi(env) : 0;
+        return (v == 1 || v == 2 || v == 4) ? v : 0;
+    }();
+    const int rpw = rpw_env ? rpw_env : (nrows < 256 ? 1 : 4);
+    const int rows_per_block = rpw * WARPS_PER_BLOCK;
+    const dim3 block_nums(static_cast<unsigned int>((static_cast<int64_t>(nrows) + rows_per_block - 1) / rows_per_block),
         static_cast<unsigned int>(ne2), static_cast<unsigned int>(ne3));
-    const dim3 block_dims(WARP_SIZE, ROWS_PER_BLOCK, 1);
+    const dim3 block_dims(WARP_SIZE, WARPS_PER_BLOCK, 1);
     const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_iq3_xxs_kepler_sb, launch_params,
+    auto kernel = rpw == 1 ? mul_mat_vec_iq3_xxs_kepler_sb<1> : rpw == 2 ? mul_mat_vec_iq3_xxs_kepler_sb<2> : mul_mat_vec_iq3_xxs_kepler_sb<4>;
+    ggml_cuda_kernel_launch(kernel, launch_params,
         src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
