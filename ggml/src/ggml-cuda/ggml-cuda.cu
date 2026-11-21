@@ -1772,11 +1772,17 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         compute_type = GGML_TYPE_F32;
     }
 
-    constexpr size_t max_src0_convert_size = 512ull * 1024 * 1024;
+    // Kepler port: below cc 5.0 every batched quantised matmul dequantises the whole weight to fp32 in the
+    // legacy pool (no VMM), e.g. a 151936x1024 vocabulary head needs 620 MB; on a 1-2 GB card that runs out
+    // of memory. Chunk by rows with a small budget there, and chunk quantised 2D weights too (a 3D view
+    // would need convert_nc, which quantised types lack).
+    const size_t max_src0_convert_size = (GGML_CUDA_CC_IS_NVIDIA(cc) && cc < 500) ?
+        16ull * 1024 * 1024 : 512ull * 1024 * 1024;
     const size_t src0_f32_size = ggml_nelements(src0) * sizeof(float);
+    const bool src0_chunkable = src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 ||
+        (ggml_is_quantized(src0->type) && src0->ne[2] == 1 && src0->ne[3] == 1);
 
-    if (compute_type == GGML_TYPE_F32 &&
-            (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
+    if (compute_type == GGML_TYPE_F32 && src0_chunkable &&
             src0_f32_size > max_src0_convert_size) {
         const size_t f32_row_size = src0_f32_size / src0->ne[1];
         const int64_t rows_per_chunk = std::max<int64_t>(1, (int64_t) (max_src0_convert_size / f32_row_size));
