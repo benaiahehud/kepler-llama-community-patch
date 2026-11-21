@@ -20,11 +20,12 @@ static_assert(offsetof(block_q6_K, d) == 208, "unexpected block_q6_K d offset");
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 // Selectable Kepler (sm_30) launch geometries:
-// - GGML_CUDA_KEPLER_MMV_Q4K: "auto" (default), "vk2", "c8", "swiz", "vk", "32x1x4", "32x1x8", "32x2x4", "8x1x4"
+// - GGML_CUDA_KEPLER_MMV_Q4K: "auto" (default), "vk2", "sy", "c8", "swiz", "vk", "32x1x4", "32x1x8", "32x2x4", "8x1x4"
 // - GGML_CUDA_KEPLER_MMV_Q6K: "auto" (default), "d32", "nb4", "smem", "vk", "32x2x4", "32x1x4", "32x1x8", "16x1x4"
 enum mmvk_q4_k_variant {
     MMVK_Q4_K_AUTO = 0,
     MMVK_Q4_K_VK2,
+    MMVK_Q4_K_SY,
     MMVK_Q4_K_C8,
     MMVK_Q4_K_SWIZ,
     MMVK_Q4_K_VK,
@@ -54,6 +55,9 @@ static mmvk_q4_k_variant ggml_cuda_kepler_mmv_q4k_variant() {
         }
         if (std::strcmp(env, "vk2") == 0) {
             return MMVK_Q4_K_VK2;
+        }
+        if (std::strcmp(env, "sy") == 0) {
+            return MMVK_Q4_K_SY;
         }
         if (std::strcmp(env, "c8") == 0) {
             return MMVK_Q4_K_C8;
@@ -624,8 +628,8 @@ static __device__ __forceinline__ void q4_k_decode_chunk_hdr(
     d_m1  = -dm.y * m1;
 }
 
-template <bool EVEN_NB, bool FULL4>
-__launch_bounds__(128)
+template <int WARPS_PER_BLOCK, bool EVEN_NB, bool FULL4, bool SHARED_Y>
+__launch_bounds__(WARP_SIZE * WARPS_PER_BLOCK)
 static __global__ void mul_mat_vec_q4_K_kepler_vk2(
         const block_q4_K * __restrict__ vx,
         const float * __restrict__ vy,
@@ -641,13 +645,12 @@ static __global__ void mul_mat_vec_q4_K_kepler_vk2(
         const int64_t stride_sample_x,
         const int64_t stride_sample_y,
         const int64_t stride_sample_dst) {
-    constexpr int WARPS_PER_BLOCK = 4;
     constexpr int ROWS_PER_WARP   = 4;
     constexpr int ROWS_PER_BLOCK  = WARPS_PER_BLOCK * ROWS_PER_WARP;
     constexpr int BLOCKS_PER_ITER = 2;
 
     const int first_row_in = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y * ROWS_PER_WARP;
-    if (first_row_in >= nrows) {
+    if (!SHARED_Y && first_row_in >= nrows) {
         return;
     }
 
@@ -660,10 +663,33 @@ static __global__ void mul_mat_vec_q4_K_kepler_vk2(
     const block_q4_K * x_base = vx + sample_x * stride_sample_x + channel_x * stride_channel_x;
     const float      * y_base = vy + blockIdx.z * stride_sample_y + blockIdx.y * stride_channel_y;
 
+    extern __shared__ float shared[];
+    float * shared_y = shared;
+    float * shared_y_sums = shared + nb * QK_K;
+    if (SHARED_Y) {
+        const int lane = threadIdx.x;
+        const int warp_base = threadIdx.y * WARP_SIZE;
+        const int count = nb * QK_K;
+        for (int i = warp_base + lane; i < count; i += WARP_SIZE * WARPS_PER_BLOCK) {
+            const float value = y_base[i];
+            shared_y[i] = value;
+            float sum = value;
+            sum += __shfl_down_sync(0xffffffffu, sum, 16);
+            sum += __shfl_down_sync(0xffffffffu, sum, 8);
+            sum += __shfl_down_sync(0xffffffffu, sum, 4);
+            sum += __shfl_down_sync(0xffffffffu, sum, 2);
+            sum += __shfl_down_sync(0xffffffffu, sum, 1);
+            if ((lane & 31) == 0) {
+                shared_y_sums[i / 32] = sum;
+            }
+        }
+        __syncthreads();
+    }
+
     const uint8_t * x_ptr   = reinterpret_cast<const uint8_t *>(x_base + static_cast<int64_t>(first_row_in) * stride_row_x + ix_init);
     const int64_t row_bytes = stride_row_x * static_cast<int64_t>(sizeof(block_q4_K));
     const int row_lim       = FULL4 ? 3 : ((nrows - 1 - first_row_in < 3) ? (nrows - 1 - first_row_in) : 3);
-    const float4 * y4       = reinterpret_cast<const float4 *>(y_base + static_cast<int64_t>(ix_init) * QK_K + y_off0);
+    const float4 * y4       = reinterpret_cast<const float4 *>((SHARED_Y ? shared_y : y_base) + static_cast<int64_t>(ix_init) * QK_K + y_off0);
 
     float acc[ROWS_PER_WARP] = { 0.0f, 0.0f, 0.0f, 0.0f };
     float mt_acc = 0.0f;
@@ -671,11 +697,12 @@ static __global__ void mul_mat_vec_q4_K_kepler_vk2(
 #pragma unroll 1
     for (int rem = nb; ; ) {
         const int ix    = threadIdx.x >> 4;
+        const int block_index = nb - rem + ix;
         const int itid  = threadIdx.x & 15;
         const int c0    = (itid >> 3) & 1;
         const int r_hdr = itid >> 2;
         const int c_hdr = itid & 3;
-        const bool valid = EVEN_NB ? true : (ix < rem);
+        const bool valid = (first_row_in < nrows) && (EVEN_NB ? true : (ix < rem));
 
         // Stepped row pointers avoid 64-bit IMUL and row_lim checks on FULL4 shapes.
         const uint8_t * p_hdr = FULL4 ? (x_ptr + r_hdr * row_bytes) : (x_ptr + ((r_hdr <= row_lim) ? r_hdr * row_bytes : 0));
@@ -695,15 +722,21 @@ static __global__ void mul_mat_vec_q4_K_kepler_vk2(
 
         // Half 0 (chunks 0 & 1)
         {
-            const float sy0 = (by0_h0.x + by0_h0.y) + (by0_h0.z + by0_h0.w);
-            const float sy1 = (by1_h0.x + by1_h0.y) + (by1_h0.z + by1_h0.w);
-            const bool odd_l = (itid & 1) != 0;
-            float sp = (odd_l ? sy1 : sy0) + __shfl_xor_sync(0xffffffffu, odd_l ? sy0 : sy1, 1, 8);
-            sp += __shfl_xor_sync(0xffffffffu, sp, 2, 8);
-            sp += __shfl_xor_sync(0xffffffffu, sp, 4, 8);
-            const int sy_src = (c_hdr & 1) << 3;
-            const float my_sy0 = __shfl_sync(0xffffffffu, sp, sy_src,     16);
-            const float my_sy1 = __shfl_sync(0xffffffffu, sp, sy_src | 1, 16);
+            float my_sy0, my_sy1;
+            if (SHARED_Y) {
+                my_sy0 = valid ? shared_y_sums[block_index * 8 + c_hdr * 2] : 0.0f;
+                my_sy1 = valid ? shared_y_sums[block_index * 8 + c_hdr * 2 + 1] : 0.0f;
+            } else {
+                const float sy0 = (by0_h0.x + by0_h0.y) + (by0_h0.z + by0_h0.w);
+                const float sy1 = (by1_h0.x + by1_h0.y) + (by1_h0.z + by1_h0.w);
+                const bool odd_l = (itid & 1) != 0;
+                float sp = (odd_l ? sy1 : sy0) + __shfl_xor_sync(0xffffffffu, odd_l ? sy0 : sy1, 1, 8);
+                sp += __shfl_xor_sync(0xffffffffu, sp, 2, 8);
+                sp += __shfl_xor_sync(0xffffffffu, sp, 4, 8);
+                const int sy_src = (c_hdr & 1) << 3;
+                my_sy0 = __shfl_sync(0xffffffffu, sp, sy_src, 16);
+                my_sy1 = __shfl_sync(0xffffffffu, sp, sy_src | 1, 16);
+            }
             if (valid && c_hdr < 2) {
                 mt_acc = fmaf(my_sy0, d_m0, fmaf(my_sy1, d_m1, mt_acc));
             }
@@ -751,15 +784,21 @@ static __global__ void mul_mat_vec_q4_K_kepler_vk2(
             qs_a = valid ? *reinterpret_cast<const uint32_t *>(q0 + 64) : 0u;
             qs_b = valid ? *reinterpret_cast<const uint32_t *>(q1 + 64) : 0u;
 
-            const float sy0 = (by0.x + by0.y) + (by0.z + by0.w);
-            const float sy1 = (by1.x + by1.y) + (by1.z + by1.w);
-            const bool odd_l = (itid & 1) != 0;
-            float sp = (odd_l ? sy1 : sy0) + __shfl_xor_sync(0xffffffffu, odd_l ? sy0 : sy1, 1, 8);
-            sp += __shfl_xor_sync(0xffffffffu, sp, 2, 8);
-            sp += __shfl_xor_sync(0xffffffffu, sp, 4, 8);
-            const int sy_src = (c_hdr & 1) << 3;
-            const float my_sy0 = __shfl_sync(0xffffffffu, sp, sy_src,     16);
-            const float my_sy1 = __shfl_sync(0xffffffffu, sp, sy_src | 1, 16);
+            float my_sy0, my_sy1;
+            if (SHARED_Y) {
+                my_sy0 = valid ? shared_y_sums[block_index * 8 + c_hdr * 2] : 0.0f;
+                my_sy1 = valid ? shared_y_sums[block_index * 8 + c_hdr * 2 + 1] : 0.0f;
+            } else {
+                const float sy0 = (by0.x + by0.y) + (by0.z + by0.w);
+                const float sy1 = (by1.x + by1.y) + (by1.z + by1.w);
+                const bool odd_l = (itid & 1) != 0;
+                float sp = (odd_l ? sy1 : sy0) + __shfl_xor_sync(0xffffffffu, odd_l ? sy0 : sy1, 1, 8);
+                sp += __shfl_xor_sync(0xffffffffu, sp, 2, 8);
+                sp += __shfl_xor_sync(0xffffffffu, sp, 4, 8);
+                const int sy_src = (c_hdr & 1) << 3;
+                my_sy0 = __shfl_sync(0xffffffffu, sp, sy_src, 16);
+                my_sy1 = __shfl_sync(0xffffffffu, sp, sy_src | 1, 16);
+            }
             if (valid && c_hdr >= 2) {
                 mt_acc = fmaf(my_sy0, d_m0, fmaf(my_sy1, d_m1, mt_acc));
             }
@@ -816,7 +855,7 @@ static __global__ void mul_mat_vec_q4_K_kepler_vk2(
 
     const int first_row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y * ROWS_PER_WARP;
     const float sum = warp_reduce_sum_4rows_packed(acc[0], acc[1], acc[2], acc[3], lane_out);
-    if (lane_out < ROWS_PER_WARP && (FULL4 || first_row + lane_out < nrows)) {
+    if (lane_out < ROWS_PER_WARP && first_row + lane_out < nrows) {
         float * dst_base = dst + blockIdx.z * stride_sample_dst + blockIdx.y * stride_channel_dst;
         dst_base[first_row + lane_out] = sum;
     }
@@ -2006,7 +2045,7 @@ static void launch_mmvk_q4_k_vk2(
 
     if ((nb & 1) == 0 && (nrows & 3) == 0) {
         ggml_cuda_kernel_launch(
-            mul_mat_vec_q4_K_kepler_vk2<true, true>,
+            mul_mat_vec_q4_K_kepler_vk2<4, true, true, false>,
             launch_params,
             src0_d, src1_d, dst_d,
             nb, nrows, stride_row_x,
@@ -2014,7 +2053,40 @@ static void launch_mmvk_q4_k_vk2(
             sample_ratio,  stride_sample_x,  stride_sample_y,  stride_sample_dst);
     } else {
         ggml_cuda_kernel_launch(
-            mul_mat_vec_q4_K_kepler_vk2<false, false>,
+            mul_mat_vec_q4_K_kepler_vk2<4, false, false, false>,
+            launch_params,
+            src0_d, src1_d, dst_d,
+            nb, nrows, stride_row_x,
+            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+            sample_ratio,  stride_sample_x,  stride_sample_y,  stride_sample_dst);
+    }
+}
+
+template <int WARPS_PER_BLOCK>
+static void launch_mmvk_q4_k_sy(
+        const block_q4_K * src0_d, const float * src1_d, float * dst_d,
+        const int nb, const int nrows, const int64_t stride_row_x,
+        const uint3 channel_ratio, const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
+        const uint3 sample_ratio,  const int64_t stride_sample_x,  const int64_t stride_sample_y,  const int64_t stride_sample_dst,
+        const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    constexpr int rows_per_block = WARPS_PER_BLOCK * 4;
+    const unsigned int nblocks_x = static_cast<unsigned int>((static_cast<int64_t>(nrows) + rows_per_block - 1) / rows_per_block);
+    const dim3 block_nums(nblocks_x, static_cast<unsigned int>(ne2), static_cast<unsigned int>(ne3));
+    const dim3 block_dims(WARP_SIZE, WARPS_PER_BLOCK, 1);
+    const size_t shared_bytes = static_cast<size_t>(nb * QK_K + nb * 8) * sizeof(float);
+    const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, shared_bytes, stream);
+
+    if ((nb & 1) == 0 && (nrows & 3) == 0) {
+        ggml_cuda_kernel_launch(
+            mul_mat_vec_q4_K_kepler_vk2<WARPS_PER_BLOCK, true, true, true>,
+            launch_params,
+            src0_d, src1_d, dst_d,
+            nb, nrows, stride_row_x,
+            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+            sample_ratio,  stride_sample_x,  stride_sample_y,  stride_sample_dst);
+    } else {
+        ggml_cuda_kernel_launch(
+            mul_mat_vec_q4_K_kepler_vk2<WARPS_PER_BLOCK, false, false, true>,
             launch_params,
             src0_d, src1_d, dst_d,
             nb, nrows, stride_row_x,
@@ -2453,8 +2525,29 @@ bool ggml_cuda_mul_mat_vec_kepler(
                     sample_ratio,  stride_sample_x,  stride_sample_y,  stride_sample_dst,
                     dst->ne[2], dst->ne[3], stream);
                 break;
-            case MMVK_Q4_K_VK2:
+            case MMVK_Q4_K_SY:
+                launch_mmvk_q4_k_sy<16>(
+                    src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+                    channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio,  stride_sample_x,  stride_sample_y,  stride_sample_dst,
+                    dst->ne[2], dst->ne[3], stream);
+                break;
             case MMVK_Q4_K_AUTO:
+                if (nb == 4 && nrows == 512) {
+                    launch_mmvk_q4_k_sy<16>(
+                        src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+                        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                        sample_ratio,  stride_sample_x,  stride_sample_y,  stride_sample_dst,
+                        dst->ne[2], dst->ne[3], stream);
+                } else {
+                    launch_mmvk_q4_k_vk2(
+                        src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+                        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                        sample_ratio,  stride_sample_x,  stride_sample_y,  stride_sample_dst,
+                        dst->ne[2], dst->ne[3], stream);
+                }
+                break;
+            case MMVK_Q4_K_VK2:
             default:
                 launch_mmvk_q4_k_vk2(
                     src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
