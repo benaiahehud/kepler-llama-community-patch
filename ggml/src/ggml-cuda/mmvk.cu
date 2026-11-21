@@ -81,7 +81,7 @@ static mmvk_q4_k_variant ggml_cuda_kepler_mmv_q4k_variant() {
             return MMVK_Q4_K_8x1x4;
         }
         GGML_LOG_WARN("%s: unknown GGML_CUDA_KEPLER_MMV_Q4K=\"%s\", using auto "
-                      "(valid: auto vk2 c8 swiz vk 32x1x4 32x1x8 32x2x4 8x1x4)\n", __func__, env);
+                      "(valid: auto vk2 sy c8 swiz vk 32x1x4 32x1x8 32x2x4 8x1x4)\n", __func__, env);
         return MMVK_Q4_K_AUTO;
     }();
     return variant;
@@ -2315,6 +2315,18 @@ static void launch_mmvk_q6_k(
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// Q4_K `sy` keeps the whole y row (nb*256 floats) plus 8 sub-block sums per block in shared memory; sm_30 gives a
+// block at most 48 KB, so rows longer than nb = 45 (k = 11520) cannot use it.
+static constexpr size_t MMVK_SY_SMEM_LIMIT = 48 * 1024;
+static void mmvk_warn_fallback_once(const char * env_name, const char * requested, const char * used, const int nb) {
+    static bool warned = false;   // only Q4_K `sy` uses this today
+    if (!warned) {
+        warned = true;
+        GGML_LOG_WARN("%s: %s=%s cannot run this shape (nb=%d blocks per row needs more than 48 KB of shared memory); "
+                      "using %s for such shapes\n", __func__, env_name, requested, nb, used);
+    }
+}
+
 // An explicitly requested Q6_K variant that cannot run for a shape falls back to another kernel; say so
 // once per requested variant, so a benchmark of `d32`/`smem`/`nb4` that actually ran `vk` is visible.
 static void mmvk_q6_k_warn_fallback(const char * requested, const char * used, const int nb) {
@@ -2475,6 +2487,7 @@ bool ggml_cuda_mul_mat_vec_kepler(
 
     if (src0->type == GGML_TYPE_Q4_K) {
         const block_q4_K * src0_d = static_cast<const block_q4_K *>(src0->data);
+        const bool q4_sy_fits = static_cast<size_t>(nb) * (QK_K + 8) * sizeof(float) <= MMVK_SY_SMEM_LIMIT;
         switch (ggml_cuda_kepler_mmv_q4k_variant()) {
             case MMVK_Q4_K_32x1x4:
                 launch_mmvk_q4_k<32, 1, 4>(
@@ -2526,14 +2539,25 @@ bool ggml_cuda_mul_mat_vec_kepler(
                     dst->ne[2], dst->ne[3], stream);
                 break;
             case MMVK_Q4_K_SY:
-                launch_mmvk_q4_k_sy<16>(
+                if (q4_sy_fits) {
+                    launch_mmvk_q4_k_sy<16>(
+                        src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+                        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                        sample_ratio,  stride_sample_x,  stride_sample_y,  stride_sample_dst,
+                        dst->ne[2], dst->ne[3], stream);
+                    break;
+                }
+                mmvk_warn_fallback_once("GGML_CUDA_KEPLER_MMV_Q4K", "sy", "vk2", nb);
+                launch_mmvk_q4_k_vk2(
                     src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
                     channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                     sample_ratio,  stride_sample_x,  stride_sample_y,  stride_sample_dst,
                     dst->ne[2], dst->ne[3], stream);
                 break;
             case MMVK_Q4_K_AUTO:
-                if (nb == 4 && nrows == 512) {
+                // `sy` (y in shared memory) measured faster than vk2 for long rows (1024x4608, nb 18: 98.9 vs
+                // 109.7 us) and for 512x1024; slower for the other k = 1024 shapes and the 65536-row head.
+                if (q4_sy_fits && (nb >= 16 || (nb == 4 && nrows == 512))) {
                     launch_mmvk_q4_k_sy<16>(
                         src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
                         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
