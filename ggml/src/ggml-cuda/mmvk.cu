@@ -24,6 +24,7 @@ static_assert(offsetof(block_q6_K, d) == 208, "unexpected block_q6_K d offset");
 // - GGML_CUDA_KEPLER_MMV_Q4K: "auto" (default), "vk2", "sy", "c8", "swiz", "vk", "32x1x4", "32x1x8", "32x2x4", "8x1x4"
 // - GGML_CUDA_KEPLER_MMV_Q6K: "auto" (default), "d32", "nb4", "smem", "vk", "32x2x4", "32x1x4", "32x1x8", "16x1x4"
 // - GGML_CUDA_KEPLER_MMV_Q8: "auto" (default), "pair", "safe"
+// - GGML_CUDA_KEPLER_MMV_IQ3: "auto" (default), "sb", "off"
 enum mmvk_q4_k_variant {
     MMVK_Q4_K_AUTO = 0,
     MMVK_Q4_K_VK2,
@@ -55,6 +56,14 @@ enum mmvk_q8_0_variant {
     MMVK_Q8_0_SAFE,
     MMVK_Q8_0_WS,
 };
+
+static bool ggml_cuda_kepler_mmv_iq3_sb_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_CUDA_KEPLER_MMV_IQ3");
+        return env == nullptr || std::strcmp(env, "off") != 0;   // r15: on by default ("auto"/"sb"); "off" = stock
+    }();
+    return enabled;
+}
 
 static mmvk_q8_0_variant ggml_cuda_kepler_mmv_q8_variant() {
     static const mmvk_q8_0_variant variant = []() {
@@ -2993,6 +3002,111 @@ static bool ggml_cuda_kepler_mmv_enabled() {
     return enabled;
 }
 
+static_assert(sizeof(block_iq3_xxs) == 98, "unexpected block_iq3_xxs size");
+
+__launch_bounds__(128)
+static __global__ void mul_mat_vec_iq3_xxs_kepler_sb(
+        const char * __restrict__ vx,
+        const float * __restrict__ vy,
+        float * __restrict__ dst,
+        const int nb,
+        const int nrows,
+        const int64_t stride_row_x,
+        const uint3 channel_ratio,
+        const int64_t stride_channel_x,
+        const int64_t stride_channel_y,
+        const int64_t stride_channel_dst,
+        const uint3 sample_ratio,
+        const int64_t stride_sample_x,
+        const int64_t stride_sample_y,
+        const int64_t stride_sample_dst) {
+    // grid table in shared memory. Staged with explicit indices: a `for (i = tid; i < 256; i += 128)` loop is
+    // miscompiled by this toolchain (clang-22 + ptxas 10.2, sm_30: the remainder trip count comes out as
+    // `ISUB R, R4, R4` = 0, so entries 128..255 were never written; probe: iq3-table-probe.cu, 2026-11-21).
+    __shared__ uint32_t grid_s[256];
+    {
+        const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;   // blockDim = (32, 4)
+        grid_s[tid]       = iq3xxs_grid[tid];
+        grid_s[tid + 128] = iq3xxs_grid[tid + 128];
+    }
+    __syncthreads();
+
+    const int lane = threadIdx.x;
+    const int ib32 = lane >> 2;
+    const int l = lane & 3;
+    const int row = blockIdx.x * 4 + threadIdx.y;
+    const uint32_t channel_x = fastdiv(blockIdx.y, channel_ratio);
+    const uint32_t sample_x = fastdiv(blockIdx.z, sample_ratio);
+    const char * x_base = vx + sample_x * stride_sample_x * sizeof(block_iq3_xxs)
+        + channel_x * stride_channel_x * sizeof(block_iq3_xxs);
+    const float * y_base = vy + blockIdx.z * stride_sample_y + blockIdx.y * stride_channel_y;
+    float acc = 0.0f;
+
+    if (row < nrows) {
+        const char * row_x = x_base + row * stride_row_x * sizeof(block_iq3_xxs);
+        for (int b = 0; b < nb; ++b) {
+            const char * block = row_x + b * sizeof(block_iq3_xxs);
+            const uint16_t * halfwords = reinterpret_cast<const uint16_t *>(block);
+            const uint16_t q = halfwords[1 + 4 * ib32 + l];
+            const uint32_t aux = static_cast<uint32_t>(halfwords[33 + 2 * ib32])
+                | (static_cast<uint32_t>(halfwords[34 + 2 * ib32]) << 16);
+            half d_h;
+            memcpy(&d_h, halfwords, sizeof(d_h));
+            const float d = __half2float(d_h);
+            const float db = d * (0.5f + static_cast<float>(aux >> 28)) * 0.5f;
+            // sign byte = 7-bit index plus even parity in bit 7 (equals ksigns_iq2xs for all 128 values: probe)
+            const uint32_t s7 = (aux >> (7 * l)) & 127u;
+            const uint32_t signs = s7 | ((__popc(s7) & 1u) << 7);
+            const uint32_t g1 = grid_s[q & 0xffu];
+            const uint32_t g2 = grid_s[q >> 8];
+            const int y_index = b * QK_K + 32 * ib32 + 8 * l;
+            const float4 y1 = *reinterpret_cast<const float4 *>(y_base + y_index);
+            const float4 y2 = *reinterpret_cast<const float4 *>(y_base + y_index + 4);
+            // grid bytes -> floats with the magic-number trick; sign j applied by XOR into the float sign bit
+            uint32_t u;
+            float dot = 0.0f;
+            asm("or.b32 %0, %1, 0xff000000;" : "=r"(u) : "r"(g1));
+            dot = fmaf(__uint_as_float(__float_as_uint(__fadd_rn(__uint_as_float(u & 0x4B0000FFu), -8388608.0f)) ^ ((signs << 31) & 0x80000000u)), y1.x, dot);
+            dot = fmaf(__uint_as_float(__float_as_uint(__fadd_rn(__uint_as_float(u & 0x4700FF00u), -32768.0f)) ^ ((signs << 30) & 0x80000000u)), y1.y, dot);
+            asm("or.b32 %0, %1, 0xff000000;" : "=r"(u) : "r"(g1 >> 16));
+            dot = fmaf(__uint_as_float(__float_as_uint(__fadd_rn(__uint_as_float(u & 0x4B0000FFu), -8388608.0f)) ^ ((signs << 29) & 0x80000000u)), y1.z, dot);
+            dot = fmaf(__uint_as_float(__float_as_uint(__fadd_rn(__uint_as_float(u & 0x4700FF00u), -32768.0f)) ^ ((signs << 28) & 0x80000000u)), y1.w, dot);
+            asm("or.b32 %0, %1, 0xff000000;" : "=r"(u) : "r"(g2));
+            dot = fmaf(__uint_as_float(__float_as_uint(__fadd_rn(__uint_as_float(u & 0x4B0000FFu), -8388608.0f)) ^ ((signs << 27) & 0x80000000u)), y2.x, dot);
+            dot = fmaf(__uint_as_float(__float_as_uint(__fadd_rn(__uint_as_float(u & 0x4700FF00u), -32768.0f)) ^ ((signs << 26) & 0x80000000u)), y2.y, dot);
+            asm("or.b32 %0, %1, 0xff000000;" : "=r"(u) : "r"(g2 >> 16));
+            dot = fmaf(__uint_as_float(__float_as_uint(__fadd_rn(__uint_as_float(u & 0x4B0000FFu), -8388608.0f)) ^ ((signs << 25) & 0x80000000u)), y2.z, dot);
+            dot = fmaf(__uint_as_float(__float_as_uint(__fadd_rn(__uint_as_float(u & 0x4700FF00u), -32768.0f)) ^ ((signs << 24) & 0x80000000u)), y2.w, dot);
+            acc = fmaf(dot, db, acc);
+        }
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down(acc, offset);
+    }
+    if (lane == 0 && row < nrows) {
+        float * dst_base = dst + blockIdx.z * stride_sample_dst + blockIdx.y * stride_channel_dst;
+        dst_base[row] = acc;
+    }
+}
+
+static void launch_mmvk_iq3_xxs_sb(
+        const char * src0_d, const float * src1_d, float * dst_d,
+        const int nb, const int nrows, const int64_t stride_row_x,
+        const uint3 channel_ratio, const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
+        const uint3 sample_ratio, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
+        const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    constexpr int ROWS_PER_BLOCK = 4;
+    const dim3 block_nums(static_cast<unsigned int>((nrows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
+        static_cast<unsigned int>(ne2), static_cast<unsigned int>(ne3));
+    const dim3 block_dims(WARP_SIZE, ROWS_PER_BLOCK, 1);
+    const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
+    ggml_cuda_kernel_launch(mul_mat_vec_iq3_xxs_kepler_sb, launch_params,
+        src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+}
+
 template <typename T>
 static __global__ void mul_mat_vec_kepler_attn_kq(
         const T * x, const float * y, float * dst,
@@ -3132,7 +3246,7 @@ static bool ggml_cuda_mmvk_shape_supported(const ggml_tensor * src0, const ggml_
         return false;
     }
     if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_Q8_0 &&
-            src0->type != GGML_TYPE_Q5_0) {
+            src0->type != GGML_TYPE_Q5_0 && !(src0->type == GGML_TYPE_IQ3_XXS && ggml_cuda_kepler_mmv_iq3_sb_enabled())) {
         return false;
     }
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
@@ -3257,6 +3371,15 @@ bool ggml_cuda_mul_mat_vec_kepler(
     const float * src1_d = static_cast<const float *>(src1->data);
     float       * dst_d  = static_cast<float *>(dst->data);
     cudaStream_t  stream = ctx.stream();
+
+    if (src0->type == GGML_TYPE_IQ3_XXS) {
+        launch_mmvk_iq3_xxs_sb(
+            static_cast<const char *>(src0->data), src1_d, dst_d, nb, nrows, stride_row_x,
+            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
+            dst->ne[2], dst->ne[3], stream);
+        return true;
+    }
 
     if (src0->type == GGML_TYPE_Q4_K) {
         const block_q4_K * src0_d = static_cast<const block_q4_K *>(src0->data);
