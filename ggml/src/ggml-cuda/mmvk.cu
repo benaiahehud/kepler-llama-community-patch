@@ -21,7 +21,7 @@ static_assert(offsetof(block_q6_K, d) == 208, "unexpected block_q6_K d offset");
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 // Selectable Kepler (sm_30) launch geometries:
-// - GGML_CUDA_KEPLER_MMV_Q3K: "auto" (default/pl), "pl", "v1", "off"
+// - GGML_CUDA_KEPLER_MMV_Q3K: "auto" (default/pl2), "pl", "pl2", "v1", "off"
 // - GGML_CUDA_KEPLER_MMV_Q4K: "auto" (default), "vk2", "sy", "c8", "swiz", "vk", "32x1x4", "32x1x8", "32x2x4", "8x1x4"
 // - GGML_CUDA_KEPLER_MMV_Q6K: "auto" (default), "d32", "nb4", "smem", "vk", "32x2x4", "32x1x4", "32x1x8", "16x1x4"
 // - GGML_CUDA_KEPLER_MMV_Q8: "auto" (default), "pair", "safe"
@@ -2235,6 +2235,131 @@ static __global__ void mul_mat_vec_q3_K_kepler_pl(
     }
 }
 
+__launch_bounds__(128)
+static __global__ void mul_mat_vec_q3_K_kepler_pl2(
+        const block_q3_K * __restrict__ vx,
+        const float * __restrict__ vy,
+        float * __restrict__ dst,
+        const int nb,
+        const int nrows,
+        const int64_t stride_row_x,
+        const uint3 channel_ratio,
+        const int64_t stride_channel_x,
+        const int64_t stride_channel_y,
+        const int64_t stride_channel_dst,
+        const uint3 sample_ratio,
+        const int64_t stride_sample_x,
+        const int64_t stride_sample_y,
+        const int64_t stride_sample_dst) {
+    constexpr int ROWS_PER_BLOCK = 8;
+    const int row0 = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y * 2;
+    const bool row1_ok = row0 + 1 < nrows;
+    const int lane = threadIdx.x;
+    const int sb = lane >> 3;
+    const int c = lane & 7;
+    const uint32_t channel_x = fastdiv(blockIdx.y, channel_ratio);
+    const uint32_t sample_x = fastdiv(blockIdx.z, sample_ratio);
+    const block_q3_K * x_base = vx + sample_x * stride_sample_x + channel_x * stride_channel_x;
+    const float * y_base = vy + blockIdx.z * stride_sample_y + blockIdx.y * stride_channel_y;
+    float row0_even = 0.0f;
+    float row0_odd = 0.0f;
+    float row1_even = 0.0f;
+    float row1_odd = 0.0f;
+
+    for (int ib = 0; ib < nb; ib += 4) {
+        if (ib + sb < nb) {
+            const uint8_t * block0 = reinterpret_cast<const uint8_t *>(x_base + row0 * stride_row_x + ib + sb);
+            const uint8_t * block1 = reinterpret_cast<const uint8_t *>(x_base + (row0 + 1) * stride_row_x + ib + sb);
+            uint32_t qsw0_0 = 0;
+            uint32_t qsw1_0 = 0;
+            uint32_t hm0 = 0;
+            uint32_t qsw0_1 = 0;
+            uint32_t qsw1_1 = 0;
+            uint32_t hm1 = 0;
+            float dscale0[8];
+            float dscale1[8];
+            if (row0 < nrows) {
+                qsw0_0 = load_u32_q3_k_safe(block0 + 32 + c * 4);
+                qsw1_0 = load_u32_q3_k_safe(block0 + 64 + c * 4);
+                hm0 = load_u32_q3_k_safe(block0 + c * 4);
+                const float d = __half2float(*reinterpret_cast<const half *>(block0 + 108));
+                const uint8_t * scales = block0 + 96;
+#pragma unroll
+                for (int m = 0; m < 8; ++m) {
+                    const int scale_index = 2 * m + (c >= 4);
+                    const uint32_t scale = ((scales[scale_index & 7] >> ((scale_index >> 3) << 2)) & 15) |
+                            (((scales[8 + (scale_index & 3)] >> ((scale_index >> 2) << 1)) & 3) << 4);
+                    const float signed_scale = __fadd_rn(__uint_as_float(0x4B000000u | scale), -8388640.0f);
+                    dscale0[m] = d * signed_scale;
+                }
+            }
+            if (row1_ok) {
+                qsw0_1 = load_u32_q3_k_safe(block1 + 32 + c * 4);
+                qsw1_1 = load_u32_q3_k_safe(block1 + 64 + c * 4);
+                hm1 = load_u32_q3_k_safe(block1 + c * 4);
+                const float d = __half2float(*reinterpret_cast<const half *>(block1 + 108));
+                const uint8_t * scales = block1 + 96;
+#pragma unroll
+                for (int m = 0; m < 8; ++m) {
+                    const int scale_index = 2 * m + (c >= 4);
+                    const uint32_t scale = ((scales[scale_index & 7] >> ((scale_index >> 3) << 2)) & 15) |
+                            (((scales[8 + (scale_index & 3)] >> ((scale_index >> 2) << 1)) & 3) << 4);
+                    const float signed_scale = __fadd_rn(__uint_as_float(0x4B000000u | scale), -8388640.0f);
+                    dscale1[m] = d * signed_scale;
+                }
+            }
+#pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                const float4 y = *reinterpret_cast<const float4 *>(y_base + ib * QK_K + sb * QK_K + m * 32 + c * 4);
+                const uint32_t qsw0 = (m < 4) ? qsw0_0 : qsw1_0;
+                const uint32_t lo0 = (qsw0 >> (2 * (m & 3))) & 0x03030303u;
+                const uint32_t hi0 = ((hm0 >> m) & 0x01010101u) << 2;
+                const uint32_t qsw1 = (m < 4) ? qsw0_1 : qsw1_1;
+                const uint32_t lo1 = (qsw1 >> (2 * (m & 3))) & 0x03030303u;
+                const uint32_t hi1 = ((hm1 >> m) & 0x01010101u) << 2;
+                if ((m & 1) == 0) {
+                    if (row0 < nrows) {
+                        row0_even = fmaf(dot4_u3_bias(lo0 | hi0, y), dscale0[m], row0_even);
+                    }
+                    if (row1_ok) {
+                        row1_even = fmaf(dot4_u3_bias(lo1 | hi1, y), dscale1[m], row1_even);
+                    }
+                } else {
+                    if (row0 < nrows) {
+                        row0_odd = fmaf(dot4_u3_bias(lo0 | hi0, y), dscale0[m], row0_odd);
+                    }
+                    if (row1_ok) {
+                        row1_odd = fmaf(dot4_u3_bias(lo1 | hi1, y), dscale1[m], row1_odd);
+                    }
+                }
+            }
+        }
+    }
+
+    float sum0 = row0_even + row0_odd;
+    float sum1 = row1_even + row1_odd;
+    sum0 += __shfl_xor_sync(0xffffffffu, sum0, 16);
+    sum0 += __shfl_xor_sync(0xffffffffu, sum0, 8);
+    sum0 += __shfl_xor_sync(0xffffffffu, sum0, 4);
+    sum0 += __shfl_xor_sync(0xffffffffu, sum0, 2);
+    sum0 += __shfl_xor_sync(0xffffffffu, sum0, 1);
+    sum1 += __shfl_xor_sync(0xffffffffu, sum1, 16);
+    sum1 += __shfl_xor_sync(0xffffffffu, sum1, 8);
+    sum1 += __shfl_xor_sync(0xffffffffu, sum1, 4);
+    sum1 += __shfl_xor_sync(0xffffffffu, sum1, 2);
+    sum1 += __shfl_xor_sync(0xffffffffu, sum1, 1);
+
+    if (lane == 0) {
+        float * dst_base = dst + blockIdx.z * stride_sample_dst + blockIdx.y * stride_channel_dst;
+        if (row0 < nrows) {
+            dst_base[row0] = sum0;
+        }
+        if (row1_ok) {
+            dst_base[row0 + 1] = sum1;
+        }
+    }
+}
+
 static void launch_mmvk_q3_k_pl(
         const block_q3_K * src0_d, const float * src1_d, float * dst_d,
         const int nb, const int nrows, const int64_t stride_row_x,
@@ -2250,6 +2375,27 @@ static void launch_mmvk_q3_k_pl(
 
     ggml_cuda_kernel_launch(
         mul_mat_vec_q3_K_kepler_pl,
+        launch_params,
+        src0_d, src1_d, dst_d,
+        nb, nrows, stride_row_x,
+        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+}
+
+static void launch_mmvk_q3_k_pl2(
+        const block_q3_K * src0_d, const float * src1_d, float * dst_d,
+        const int nb, const int nrows, const int64_t stride_row_x,
+        const uint3 channel_ratio, const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
+        const uint3 sample_ratio,  const int64_t stride_sample_x,  const int64_t stride_sample_y,  const int64_t stride_sample_dst,
+        const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    constexpr int rows_per_block = 8;
+    const unsigned int nblocks_x = static_cast<unsigned int>((static_cast<int64_t>(nrows) + rows_per_block - 1) / rows_per_block);
+    const dim3 block_nums(nblocks_x, static_cast<unsigned int>(ne2), static_cast<unsigned int>(ne3));
+    const dim3 block_dims(WARP_SIZE, 4, 1);
+    const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
+
+    ggml_cuda_kernel_launch(
+        mul_mat_vec_q3_K_kepler_pl2,
         launch_params,
         src0_d, src1_d, dst_d,
         nb, nrows, stride_row_x,
@@ -3580,6 +3726,13 @@ bool ggml_cuda_mul_mat_vec_kepler(
         const char * variant = std::getenv("GGML_CUDA_KEPLER_MMV_Q3K");
         if (variant != nullptr && std::strcmp(variant, "v1") == 0) {
             launch_mmvk_q3_k_v1(
+                src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
+                dst->ne[2], dst->ne[3], stream);
+        } else if ((variant == nullptr || std::strcmp(variant, "auto") == 0) ||
+                std::strcmp(variant, "pl2") == 0) {
+            launch_mmvk_q3_k_pl2(
                 src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
