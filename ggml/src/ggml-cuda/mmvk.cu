@@ -1,9 +1,11 @@
 #include "mmvk.cuh"
 
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 static_assert(sizeof(block_q4_K) == 144, "unexpected block_q4_K size");
 static_assert(offsetof(block_q4_K, scales) == 4, "unexpected block_q4_K scales offset");
@@ -74,6 +76,8 @@ static mmvk_q4_k_variant ggml_cuda_kepler_mmv_q4k_variant() {
         if (std::strcmp(env, "8x1x4") == 0) {
             return MMVK_Q4_K_8x1x4;
         }
+        GGML_LOG_WARN("%s: unknown GGML_CUDA_KEPLER_MMV_Q4K=\"%s\", using auto "
+                      "(valid: auto vk2 c8 swiz vk 32x1x4 32x1x8 32x2x4 8x1x4)\n", __func__, env);
         return MMVK_Q4_K_AUTO;
     }();
     return variant;
@@ -109,6 +113,8 @@ static mmvk_q6_k_variant ggml_cuda_kepler_mmv_q6k_variant() {
         if (std::strcmp(env, "16x1x4") == 0) {
             return MMVK_Q6_K_16x1x4;
         }
+        GGML_LOG_WARN("%s: unknown GGML_CUDA_KEPLER_MMV_Q6K=\"%s\", using auto "
+                      "(valid: auto d32 nb4 smem vk 32x2x4 32x1x4 32x1x8 16x1x4)\n", __func__, env);
         return MMVK_Q6_K_AUTO;
     }();
     return variant;
@@ -1352,17 +1358,19 @@ static __global__ void mul_mat_vec_q6_K_kepler_vk(
 
     const int ix_init       = threadIdx.x >> 4;
     const bool lane_has_blk = (ix_init < nb);
+    // A lane group with no block (nb == 1, second 16-lane group) still forms addresses below (stitch
+    // arguments, the misalignment bit) even though every load is masked by `valid`. Point it at block 0
+    // of its own row and at the start of y instead of nullptr: arithmetic on a null pointer is undefined
+    // behaviour, while block 0 is a real 210-byte object and y holds at least QK_K floats.
+    const int ix_safe       = lane_has_blk ? ix_init : 0;
     const uint8_t * row_ptrs[ROWS_PER_WARP];
 #pragma unroll
     for (int r = 0; r < ROWS_PER_WARP; ++r) {
         const int row = (first_row_in + r < nrows) ? (first_row_in + r) : 0;
-        row_ptrs[r] = lane_has_blk
-            ? reinterpret_cast<const uint8_t *>(x_base + static_cast<int64_t>(row) * stride_row_x + ix_init)
-            : nullptr;
+        row_ptrs[r] = reinterpret_cast<const uint8_t *>(x_base + static_cast<int64_t>(row) * stride_row_x + ix_safe);
     }
-    const float4 * y4 = lane_has_blk
-        ? reinterpret_cast<const float4 *>(y_base + static_cast<int64_t>(ix_init) * QK_K + 128 * ((threadIdx.x >> 3) & 1) + 4 * (threadIdx.x & 7))
-        : nullptr;
+    const float4 * y4 = reinterpret_cast<const float4 *>(
+        y_base + static_cast<int64_t>(ix_safe) * QK_K + 128 * ((threadIdx.x >> 3) & 1) + 4 * (threadIdx.x & 7));
 
     float acc[ROWS_PER_WARP] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
@@ -2021,6 +2029,10 @@ static void launch_mmvk_q6_k_d32(
         const uint3 channel_ratio, const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
         const uint3 sample_ratio,  const int64_t stride_sample_x,  const int64_t stride_sample_y,  const int64_t stride_sample_dst,
         const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    // The d32 kernel always processes blocks in (even, odd) pairs (`ib += 2`) and has no per-block guard:
+    // an odd nb would read y and weights past the end of the row. Every caller must check this; the
+    // dispatcher does (q6_even_pairs_ok), and this assert keeps a future caller from launching it unguarded.
+    GGML_ASSERT((nb & 1) == 0 && "mul_mat_vec_q6_K_kepler_d32 needs an even number of blocks per row");
     constexpr int rows_per_block = 8;
     const unsigned int nblocks_x = static_cast<unsigned int>((static_cast<int64_t>(nrows) + rows_per_block - 1) / rows_per_block);
 
@@ -2230,10 +2242,33 @@ static void launch_mmvk_q6_k(
 
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// An explicitly requested Q6_K variant that cannot run for a shape falls back to another kernel; say so
+// once per requested variant, so a benchmark of `d32`/`smem`/`nb4` that actually ran `vk` is visible.
+static void mmvk_q6_k_warn_fallback(const char * requested, const char * used, const int nb) {
+    static bool warned_nb4 = false, warned_smem = false, warned_d32 = false;
+    bool & warned = requested[0] == 'n' ? warned_nb4 : (requested[0] == 's' ? warned_smem : warned_d32);
+    if (!warned) {
+        warned = true;
+        GGML_LOG_WARN("%s: GGML_CUDA_KEPLER_MMV_Q6K=%s cannot run this shape (nb=%d blocks per row or "
+                      "unaligned rows); using %s for such shapes\n", __func__, requested, nb, used);
+    }
+}
+#endif
+
+// GGML_CUDA_KEPLER_MMV: unset or any other value = on; "0", "off", "false", "no" (any case) = off.
+// Read once per process.
 static bool ggml_cuda_kepler_mmv_enabled() {
     static const bool enabled = []() {
         const char * env = std::getenv("GGML_CUDA_KEPLER_MMV");
-        return env == nullptr || std::strcmp(env, "0") != 0;
+        if (env == nullptr) {
+            return true;
+        }
+        std::string v(env);
+        for (char & c : v) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        return !(v == "0" || v == "off" || v == "false" || v == "no");
     }();
     return enabled;
 }
@@ -2333,6 +2368,12 @@ bool ggml_cuda_mul_mat_vec_kepler(
     GGML_UNUSED_VARS(ctx, src0, src1, dst);
     return false;
 #else
+    // Exported entry point: re-check the device here too (not only in ggml_cuda_should_use_mmvk), so a
+    // new caller can never launch these sm_30 kernels on another architecture.
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_KEPLER || cc >= 500) {
+        return false;
+    }
     if (!ggml_cuda_mmvk_shape_supported(src0, src1, dst)) {
         return false;
     }
@@ -2432,7 +2473,10 @@ bool ggml_cuda_mul_mat_vec_kepler(
             && ((reinterpret_cast<uintptr_t>(src0_d) & 3u) == 0u)
             && (src0->ne[2] == 1 || (stride_channel_x & 1) == 0)
             && (src0->ne[3] == 1 || (stride_sample_x & 1) == 0);
-        const bool q6_smem_ok = ((nb & 1) == 0)
+        // Gate for the kernels that walk blocks in (even, odd) pairs, i.e. both `smem` and `d32`: an even
+        // number of blocks per row, and row/channel/sample starts that keep the pairs 4-byte aligned.
+        // Shapes that fail it go to the `vk` kernel, which handles any nb.
+        const bool q6_even_pairs_ok = ((nb & 1) == 0)
             && ((stride_row_x & 1) == 0)
             && ((reinterpret_cast<uintptr_t>(src0_d) & 3u) == 0u)
             && (src0->ne[2] == 1 || (stride_channel_x & 1) == 0)
@@ -2483,9 +2527,10 @@ bool ggml_cuda_mul_mat_vec_kepler(
                         dst->ne[2], dst->ne[3], stream);
                     break;
                 }
+                mmvk_q6_k_warn_fallback("nb4", q6_even_pairs_ok ? "smem" : "vk", nb);
                 [[fallthrough]];
             case MMVK_Q6_K_SMEM:
-                if (q6_smem_ok) {
+                if (q6_even_pairs_ok) {
                     launch_mmvk_q6_k_smem(
                         src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
                         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -2493,6 +2538,7 @@ bool ggml_cuda_mul_mat_vec_kepler(
                         dst->ne[2], dst->ne[3], stream);
                     break;
                 }
+                mmvk_q6_k_warn_fallback("smem", "vk", nb);
                 launch_mmvk_q6_k_vk(
                     src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
                     channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -2502,7 +2548,10 @@ bool ggml_cuda_mul_mat_vec_kepler(
             case MMVK_Q6_K_D32:
             case MMVK_Q6_K_AUTO:
             default:
-                if (q6_smem_ok) {
+                if (!q6_even_pairs_ok && ggml_cuda_kepler_mmv_q6k_variant() == MMVK_Q6_K_D32) {
+                    mmvk_q6_k_warn_fallback("d32", "vk", nb);
+                }
+                if (q6_even_pairs_ok) {
                     launch_mmvk_q6_k_d32(
                         src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
                         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
