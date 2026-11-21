@@ -1527,8 +1527,28 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
             s03 *= src0_bs;
         } else {
             const auto convert_func = traits::convert_nc(src0->type);
-            GGML_ASSERT(convert_func != nullptr);
-            convert_func(src0->data, src0_alloc.get(), ne00, ne01, ne02, ne03, s01, s02, s03, main_stream);
+            if (convert_func != nullptr) {
+                convert_func(src0->data, src0_alloc.get(), ne00, ne01, ne02, ne03, s01, s02, s03, main_stream);
+            } else {
+                // Kepler r18: K-quants (and other block types) have no non-contiguous converter, and a
+                // non-contiguous quantised view used to abort here (GGML_ASSERT; test-backend-ops MUL_MAT with
+                // k_v views died mid-run since at least r9). Rows of such a view are contiguous within
+                // themselves: gather them into a contiguous buffer (one strided 2D copy per channel), then use the
+                // contiguous converter.
+                GGML_ASSERT(ggml_is_quantized(src0->type));
+                const auto convert_cont = traits::convert(src0->type);
+                GGML_ASSERT(convert_cont != nullptr);
+                const size_t row_bytes = ggml_row_size(src0->type, ne00);
+                ggml_cuda_pool_alloc<char> src0_rows(ctx.pool(), row_bytes*ne01*ne02*ne03);
+                for (int64_t i3 = 0; i3 < ne03; ++i3) {
+                    for (int64_t i2 = 0; i2 < ne02; ++i2) {
+                        CUDA_CHECK(cudaMemcpy2DAsync(src0_rows.get() + (i3*ne02 + i2)*ne01*row_bytes, row_bytes,
+                            (const char *) src0->data + i2*nb02 + i3*nb03, nb01, row_bytes, ne01,
+                            cudaMemcpyDeviceToDevice, main_stream));
+                    }
+                }
+                convert_cont(src0_rows.get(), src0_alloc.get(), ggml_nelements(src0), main_stream);
+            }
             s01 = ne00;
             s02 = ne01*s01;
             s03 = ne02*s02;
