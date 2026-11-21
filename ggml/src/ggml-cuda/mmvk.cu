@@ -2567,6 +2567,15 @@ static __device__ __forceinline__ uint32_t q5_0_quads(const uint32_t qsw, const 
     return nib | hb;
 }
 
+static __device__ __forceinline__ float q5_0_dot4_remap(const uint16_t qs, const uint32_t qh, const int g, const float4 y) {
+    const uint32_t h = qh >> (2 * g);
+    const float q0 = __fadd_rn(__uint_as_float(0x4b000000u | (qs & 0x000fu)), (h & 1u) ? -8388608.0f : -8388624.0f);
+    const float q1 = __fadd_rn(__uint_as_float(0x47000000u | (qs & 0x0f00u)), (h & 2u) ? -32768.0f : -32784.0f);
+    const float q2 = __fadd_rn(__uint_as_float(0x49000000u | (qs & 0x00f0u)), (h & 0x10000u) ? -524288.0f : -524304.0f);
+    const float q3 = __fadd_rn(__uint_as_float(0x45000000u | (qs & 0xf000u)), (h & 0x20000u) ? -2048.0f : -2064.0f);
+    return fmaf(q2, y.z, q0 * y.x) + fmaf(q3, y.w, q1 * y.y);
+}
+
 template <int U, bool SHFL>
 __launch_bounds__(128, 1)
 static __global__ void mul_mat_vec_q5_0_kepler_ws(
@@ -2698,6 +2707,118 @@ static __global__ void mul_mat_vec_q5_0_kepler_ws(
     }
 }
 
+template <int U>
+__launch_bounds__(128, 1)
+static __global__ void mul_mat_vec_q5_0_kepler_remap(
+        const block_q5_0 * __restrict__ vx,
+        const float * __restrict__ vy,
+        float * __restrict__ dst,
+        const int nb,
+        const int nrows,
+        const int64_t stride_row_x,
+        const uint3 channel_ratio,
+        const int64_t stride_channel_x,
+        const int64_t stride_channel_y,
+        const int64_t stride_channel_dst,
+        const uint3 sample_ratio,
+        const int64_t stride_sample_x,
+        const int64_t stride_sample_y,
+        const int64_t stride_sample_dst) {
+    static_assert(sizeof(block_q5_0) == 22, "unexpected block_q5_0 size");
+    constexpr int WARPS = 4;
+    constexpr int RPW = 4;
+    constexpr int RPB = WARPS * RPW;
+    constexpr int TILE_B = 32;
+    constexpr int BS = (int) sizeof(block_q5_0);
+    __shared__ float4 ys[TILE_B * 8];
+
+    const int tid  = threadIdx.y * WARP_SIZE + threadIdx.x;
+    const int lane = threadIdx.x;
+    const int bo   = lane >> 3;
+    const int g    = lane & 7;
+
+    const uint32_t channel_x = fastdiv(blockIdx.y, channel_ratio);
+    const uint32_t sample_x  = fastdiv(blockIdx.z, sample_ratio);
+    const block_q5_0 * x_base = vx + sample_x * stride_sample_x + channel_x * stride_channel_x;
+    const float * y_base = vy + blockIdx.z * stride_sample_y + blockIdx.y * stride_channel_y;
+    const int row0 = blockIdx.x * RPB + threadIdx.y * RPW;
+    const int o_qh = BS * bo + 2;
+
+    float acc[RPW];
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        acc[r] = 0.0f;
+    }
+
+    for (int tb = 0; tb < nb; tb += TILE_B) {
+        const int tn = min(TILE_B, nb - tb);
+        __syncthreads();
+        for (int i = tid; i < tn * 8; i += WARPS * WARP_SIZE) {
+            const int b = i >> 3;
+            const int j = i & 7;
+            const float * y = y_base + (tb + b) * QK5_0;
+            ys[i] = make_float4(y[2 * j], y[2 * j + 1], y[2 * j + 16], y[2 * j + 17]);
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int r = 0; r < RPW; ++r) {
+            const int row = row0 + r;
+            if (row < nrows) {
+                const block_q5_0 * xr = x_base + row * stride_row_x + tb;
+                for (int ib = 0; ib < tn; ib += 4 * U) {
+                    uint32_t qh[U];
+                    uint16_t qs[U];
+                    float d[U];
+                    uint32_t w[U];
+#pragma unroll
+                    for (int u = 0; u < U; ++u) {
+                        const int b0 = ib + 4 * u;
+                        const int nw = b0 < tn ? (min(4, tn - b0) * BS) / 4 : 0;
+                        w[u] = lane < nw ? reinterpret_cast<const uint32_t *>(xr + b0)[lane] : 0u;
+                    }
+#pragma unroll
+                    for (int u = 0; u < U; ++u) {
+                        const bool mis = (o_qh & 2) != 0;
+                        const int w_qh = o_qh >> 2;
+                        const uint32_t h0 = __shfl_sync(0xffffffffu, w[u], w_qh);
+                        const uint32_t h1 = __shfl_sync(0xffffffffu, w[u], (w_qh + (mis ? 1 : -1)) & 31);
+                        const uint32_t hq = mis ? __byte_perm(h0, h1, 0x5432u) : h0;
+                        const uint32_t qs_off = BS * bo + 6 + 2 * g;
+                        const uint32_t qs_w = __shfl_sync(0xffffffffu, w[u], qs_off >> 2);
+                        const uint16_t dbits = mis ? static_cast<uint16_t>(h0) : static_cast<uint16_t>(h1 >> 16);
+                        half dh;
+                        memcpy(&dh, &dbits, sizeof(dh));
+                        d[u] = __half2float(dh);
+                        qh[u] = hq;
+                        qs[u] = (qs_off & 2) ? static_cast<uint16_t>(qs_w >> 16) : static_cast<uint16_t>(qs_w);
+                    }
+#pragma unroll
+                    for (int u = 0; u < U; ++u) {
+                        const int b = ib + 4 * u + bo;
+                        if (b < tn) {
+                            acc[r] = fmaf(d[u], q5_0_dot4_remap(qs[u], qh[u], g, ys[b * 8 + g]), acc[r]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    float * dst_base = dst + blockIdx.z * stride_sample_dst + blockIdx.y * stride_channel_dst;
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        float v = acc[r];
+#pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            v += __shfl_xor_sync(0xffffffffu, v, offset, WARP_SIZE);
+        }
+        if (lane == 0 && row0 + r < nrows) {
+            dst_base[row0 + r] = v;
+        }
+    }
+}
+
 template <bool SHFL>
 static void launch_mmvk_q5_0_ws(
         const block_q5_0 * src0_d, const float * src1_d, float * dst_d,
@@ -2713,6 +2834,25 @@ static void launch_mmvk_q5_0_ws(
 
     ggml_cuda_kernel_launch(
         mul_mat_vec_q5_0_kepler_ws<SHFL ? 2 : 4, SHFL>, launch_params,   // SHFL at U 4 spilled 32 B
+        src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+}
+
+static void launch_mmvk_q5_0_remap(
+        const block_q5_0 * src0_d, const float * src1_d, float * dst_d,
+        const int nb, const int nrows, const int64_t stride_row_x,
+        const uint3 channel_ratio, const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
+        const uint3 sample_ratio, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
+        const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    constexpr int ROWS_PER_BLOCK = 16;
+    const unsigned int nblocks_x = static_cast<unsigned int>((static_cast<int64_t>(nrows) + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    const dim3 block_nums(nblocks_x, static_cast<unsigned int>(ne2), static_cast<unsigned int>(ne3));
+    const dim3 block_dims(WARP_SIZE, 4, 1);
+    const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
+
+    ggml_cuda_kernel_launch(
+        mul_mat_vec_q5_0_kepler_remap<2>, launch_params,
         src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
@@ -3327,8 +3467,16 @@ bool ggml_cuda_mul_mat_vec_kepler(
             && ((reinterpret_cast<uintptr_t>(src0_d) & 3u) == 0u)
             && (src0->ne[2] == 1 || (stride_channel_x & 1) == 0)
             && (src0->ne[3] == 1 || (stride_sample_x & 1) == 0);
-        static const bool q5_noshfl = std::getenv("GGML_CUDA_KEPLER_MMV_Q5_NOSHFL") != nullptr;
-        if (q5_even_pairs_ok && !q5_noshfl) {
+        const char * q5_variant = std::getenv("GGML_CUDA_KEPLER_MMV_Q5");
+        const bool q5_remap = !q5_variant || std::strcmp(q5_variant, "auto") == 0 || std::strcmp(q5_variant, "remap") == 0;
+        const bool q5_noshfl = std::getenv("GGML_CUDA_KEPLER_MMV_Q5_NOSHFL") != nullptr;
+        if (q5_remap && q5_even_pairs_ok && !q5_noshfl) {
+            launch_mmvk_q5_0_remap(
+                src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
+                dst->ne[2], dst->ne[3], stream);
+        } else if (q5_even_pairs_ok && !q5_noshfl) {
             launch_mmvk_q5_0_ws<true>(
                 src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
