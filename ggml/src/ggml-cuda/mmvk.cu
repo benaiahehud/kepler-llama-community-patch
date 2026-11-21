@@ -1,5 +1,6 @@
 #include "mmvk.cuh"
 
+#include <atomic>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -2816,9 +2817,8 @@ static void launch_mmvk_q6_k(
 // block at most 48 KB, so rows longer than nb = 45 (k = 11520) cannot use it.
 static constexpr size_t MMVK_SY_SMEM_LIMIT = 48 * 1024;
 static void mmvk_warn_fallback_once(const char * env_name, const char * requested, const char * used, const int nb) {
-    static bool warned = false;   // only Q4_K `sy` uses this today
-    if (!warned) {
-        warned = true;
+    static std::atomic<bool> warned{false};   // only Q4_K `sy` uses this today
+    if (!warned.exchange(true)) {
         GGML_LOG_WARN("%s: %s=%s cannot run this shape (nb=%d blocks per row needs more than 48 KB of shared memory); "
                       "using %s for such shapes\n", __func__, env_name, requested, nb, used);
     }
@@ -2827,10 +2827,9 @@ static void mmvk_warn_fallback_once(const char * env_name, const char * requeste
 // An explicitly requested Q6_K variant that cannot run for a shape falls back to another kernel; say so
 // once per requested variant, so a benchmark of `d32`/`smem`/`nb4` that actually ran `vk` is visible.
 static void mmvk_q6_k_warn_fallback(const char * requested, const char * used, const int nb) {
-    static bool warned_nb4 = false, warned_smem = false, warned_d32 = false;
-    bool & warned = requested[0] == 'n' ? warned_nb4 : (requested[0] == 's' ? warned_smem : warned_d32);
-    if (!warned) {
-        warned = true;
+    static std::atomic<bool> warned_nb4{false}, warned_smem{false}, warned_d32{false};
+    std::atomic<bool> & warned = requested[0] == 'n' ? warned_nb4 : (requested[0] == 's' ? warned_smem : warned_d32);
+    if (!warned.exchange(true)) {
         GGML_LOG_WARN("%s: GGML_CUDA_KEPLER_MMV_Q6K=%s cannot run this shape (nb=%d blocks per row or "
                       "unaligned rows); using %s for such shapes\n", __func__, requested, nb, used);
     }
@@ -3416,6 +3415,29 @@ bool ggml_cuda_mul_mat_vec_kepler_attn(
             || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float)) {
         return false;
     }
+    // r13 (review r9): attention operands only. Model weights (e.g. a vision projector with a 64..256 dim)
+    // live in a weights buffer and go to the normal matvec path.
+    if (src0->buffer && ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return false;
+    }
+    // r13: non-empty, 32-bit row/column counts (with room for the (rows + 7) / 8 grid), sm_30 grid y/z
+    // limit, element-aligned pointers and strides (the kernels index through typed element pointers).
+    if (src0->ne[0] <= 0 || src0->ne[1] <= 0 || src0->ne[0] > INT32_MAX - 8 || src0->ne[1] > INT32_MAX - 8
+            || dst->ne[2] > 65535 || dst->ne[3] > 65535) {
+        return false;
+    }
+    {
+        const size_t ts = ggml_type_size(src0->type);
+        if ((uintptr_t) src0->data % ts != 0 || (uintptr_t) src1->data % sizeof(float) != 0
+                || (uintptr_t) dst->data % sizeof(float) != 0) {
+            return false;
+        }
+        for (int i = 0; i < 4; ++i) {
+            if (src0->nb[i] % ts != 0 || src1->nb[i] % sizeof(float) != 0 || dst->nb[i] % sizeof(float) != 0) {
+                return false;
+            }
+        }
+    }
 
     const bool dim0_head = src0->ne[0] == 64 || src0->ne[0] == 80 || src0->ne[0] == 96 || src0->ne[0] == 128 || src0->ne[0] == 256;
     const bool dim1_head = src0->ne[1] == 64 || src0->ne[1] == 80 || src0->ne[1] == 96 || src0->ne[1] == 128 || src0->ne[1] == 256;
@@ -3437,7 +3459,7 @@ bool ggml_cuda_mul_mat_vec_kepler_attn(
                     static_cast<unsigned int>(grouped_kqv ? dst->ne[2] / 2 : dst->ne[2]),
                     static_cast<unsigned int>(dst->ne[3]));
     const dim3 block(128, 1, 1);
-    const size_t shared_bytes = kq ? 256 * sizeof(float) : (grouped_kqv ? 8 * sizeof(float) : 4 * sizeof(float));
+    const size_t shared_bytes = 0; // r13: the attention kernels declare static __shared__ arrays
     const ggml_cuda_kernel_launch_params launch_params(grid, block, shared_bytes, ctx.stream());
     const size_t nb02_dst = dst->nb[2];
     const size_t nb03_dst = dst->nb[3];
