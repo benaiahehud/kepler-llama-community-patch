@@ -2357,6 +2357,140 @@ static bool ggml_cuda_kepler_mmv_enabled() {
     return enabled;
 }
 
+template <typename T>
+static __global__ void mul_mat_vec_kepler_attn_kq(
+        const T * x, const float * y, float * dst,
+        const int k, const int rows,
+        const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
+        const int64_t nb12, const int64_t nb13, const int64_t nb02_dst, const int64_t nb03_dst,
+        const int64_t dst_nb0, const int head_ratio, const int batch_ratio) {
+    __shared__ float query[256];
+    const int tid = threadIdx.x;
+    for (int i = tid; i < k; i += 128) {
+        const char * query_ptr = reinterpret_cast<const char *>(y)
+            + (int64_t) blockIdx.y * nb12 + (int64_t) blockIdx.z * nb13 + (int64_t) i * sizeof(float);
+        query[i] = *reinterpret_cast<const float *>(query_ptr);
+    }
+    __syncthreads();
+
+    const int lane = tid & 15;
+    const int row = blockIdx.x * 8 + tid / 16;
+    const int head = blockIdx.y;
+    const int batch = blockIdx.z;
+    float sum = 0.0f;
+    if (row < rows) {
+        const char * row_ptr = reinterpret_cast<const char *>(x)
+            + (int64_t) row * nb01 + (int64_t) (head / head_ratio) * nb02 + (int64_t) (batch / batch_ratio) * nb03;
+        for (int i = lane; i < k; i += 16) {
+            const T value = *reinterpret_cast<const T *>(row_ptr + (int64_t) i * nb00);
+            sum = fmaf(static_cast<float>(value), query[i], sum);
+        }
+    }
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        sum += __shfl_down(sum, offset, 16);
+    }
+    if (lane == 0 && row < rows) {
+        char * out = reinterpret_cast<char *>(dst) + (int64_t) head * nb02_dst + (int64_t) batch * nb03_dst;
+        *reinterpret_cast<float *>(out + (int64_t) row * dst_nb0) = sum;
+    }
+}
+
+template <typename T>
+static __global__ void mul_mat_vec_kepler_attn_kqv(
+        const T * x, const float * y, float * dst,
+        const int k,
+        const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
+        const int64_t nb12, const int64_t nb13, const int64_t nb02_dst, const int64_t nb03_dst,
+        const int64_t dst_nb0, const int head_ratio, const int batch_ratio) {
+    __shared__ float partial[4];
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int row = blockIdx.x;
+    const int head = blockIdx.y;
+    const int batch = blockIdx.z;
+    const char * x_head = reinterpret_cast<const char *>(x) + (int64_t) (head / head_ratio) * nb02 + (int64_t) (batch / batch_ratio) * nb03;
+    const float * q = reinterpret_cast<const float *>(reinterpret_cast<const char *>(y)
+        + (int64_t) head * nb12 + (int64_t) batch * nb13);
+    float sum = 0.0f;
+    for (int i = tid; i < k; i += 128) {
+        const T value = *reinterpret_cast<const T *>(x_head + (int64_t) i * nb00 + (int64_t) row * nb01);
+        sum = fmaf(static_cast<float>(value), q[i], sum);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down(sum, offset);
+    }
+    if (lane == 0) {
+        partial[warp] = sum;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        const float total = (partial[0] + partial[1]) + (partial[2] + partial[3]);
+        char * out = reinterpret_cast<char *>(dst) + (int64_t) head * nb02_dst + (int64_t) batch * nb03_dst;
+        *reinterpret_cast<float *>(out + (int64_t) row * dst_nb0) = total;
+    }
+}
+
+template <typename T>
+static __global__ void mul_mat_vec_kepler_attn_kqv_gqa2(
+        const T * x, const float * y, float * dst,
+        const int k,
+        const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
+        const int64_t nb12, const int64_t nb13, const int64_t nb02_dst, const int64_t nb03_dst,
+        const int64_t dst_nb0, const int batch_ratio) {
+    __shared__ float partial[2][4];
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int row = blockIdx.x;
+    const int head0 = blockIdx.y * 2;
+    const int batch = blockIdx.z;
+    const char * x_head = reinterpret_cast<const char *>(x)
+        + (int64_t) blockIdx.y * nb02 + (int64_t) (batch / batch_ratio) * nb03;
+    const char * y_base = reinterpret_cast<const char *>(y) + (int64_t) batch * nb13;
+    const float * q0 = reinterpret_cast<const float *>(y_base + (int64_t) head0 * nb12);
+    const float * q1 = reinterpret_cast<const float *>(y_base + (int64_t) (head0 + 1) * nb12);
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    for (int i = tid; i < k; i += 128) {
+        const T value = *reinterpret_cast<const T *>(x_head + (int64_t) i * nb00 + (int64_t) row * nb01);
+        const float v = static_cast<float>(value);
+        sum0 = fmaf(v, q0[i], sum0);
+        sum1 = fmaf(v, q1[i], sum1);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum0 += __shfl_down(sum0, offset);
+        sum1 += __shfl_down(sum1, offset);
+    }
+    if (lane == 0) {
+        partial[0][warp] = sum0;
+        partial[1][warp] = sum1;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        char * out = reinterpret_cast<char *>(dst) + (int64_t) batch * nb03_dst;
+        const float total0 = (partial[0][0] + partial[0][1]) + (partial[0][2] + partial[0][3]);
+        const float total1 = (partial[1][0] + partial[1][1]) + (partial[1][2] + partial[1][3]);
+        *reinterpret_cast<float *>(out + (int64_t) row * dst_nb0 + (int64_t) head0 * nb02_dst) = total0;
+        *reinterpret_cast<float *>(out + (int64_t) row * dst_nb0 + (int64_t) (head0 + 1) * nb02_dst) = total1;
+    }
+}
+
+static bool ggml_cuda_kepler_attn_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_CUDA_KEPLER_ATTN");
+        if (env == nullptr) {
+            return true;
+        }
+        std::string value(env);
+        for (char & c : value) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        return !(value == "0" || value == "off" || value == "false" || value == "no");
+    }();
+    return enabled;
+}
+
 static bool ggml_cuda_mmvk_shape_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (src0 == nullptr || src1 == nullptr || dst == nullptr) {
         return false;
@@ -2687,5 +2821,92 @@ bool ggml_cuda_mul_mat_vec_kepler(
     }
 
     return false;
+#endif
+}
+
+bool ggml_cuda_mul_mat_vec_kepler_attn(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(ctx, src0, src1, dst);
+    return false;
+#else
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_KEPLER || cc >= 500 || !ggml_cuda_kepler_attn_enabled()) {
+        return false;
+    }
+    if ((src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_F32)
+            || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32
+            || src1->ne[1] != 1 || src0->ne[0] != src1->ne[0]
+            || src0->ne[1] != dst->ne[0] || dst->ne[1] != 1
+            || src1->ne[2] != dst->ne[2] || src1->ne[3] != dst->ne[3]
+            || src0->ne[2] <= 0 || src0->ne[3] <= 0
+            || dst->ne[2] % src0->ne[2] != 0 || dst->ne[3] % src0->ne[3] != 0
+            || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float)) {
+        return false;
+    }
+
+    const bool dim0_head = src0->ne[0] == 64 || src0->ne[0] == 80 || src0->ne[0] == 96 || src0->ne[0] == 128 || src0->ne[0] == 256;
+    const bool dim1_head = src0->ne[1] == 64 || src0->ne[1] == 80 || src0->ne[1] == 96 || src0->ne[1] == 128 || src0->ne[1] == 256;
+    bool kq = dim0_head && !dim1_head;
+    bool kqv = dim1_head && !dim0_head;
+    if (dim0_head && dim1_head) {
+        kq = src0->nb[0] < src0->nb[1];
+        kqv = src0->nb[1] < src0->nb[0];
+    }
+    if (!kq && !kqv) {
+        return false;
+    }
+    const int rows = static_cast<int>(src0->ne[1]);
+    const int k = static_cast<int>(src0->ne[0]);
+    const int head_ratio = static_cast<int>(dst->ne[2] / src0->ne[2]);
+    const int batch_ratio = static_cast<int>(dst->ne[3] / src0->ne[3]);
+    const bool grouped_kqv = kqv && head_ratio == 2;
+    const dim3 grid(kq ? (rows + 7) / 8 : rows,
+                    static_cast<unsigned int>(grouped_kqv ? dst->ne[2] / 2 : dst->ne[2]),
+                    static_cast<unsigned int>(dst->ne[3]));
+    const dim3 block(128, 1, 1);
+    const size_t shared_bytes = kq ? 256 * sizeof(float) : (grouped_kqv ? 8 * sizeof(float) : 4 * sizeof(float));
+    const ggml_cuda_kernel_launch_params launch_params(grid, block, shared_bytes, ctx.stream());
+    const size_t nb02_dst = dst->nb[2];
+    const size_t nb03_dst = dst->nb[3];
+
+    if (src0->type == GGML_TYPE_F16) {
+        const half * x = static_cast<const half *>(src0->data);
+        if (kq) {
+            ggml_cuda_kernel_launch(mul_mat_vec_kepler_attn_kq<half>, launch_params, x,
+                static_cast<const float *>(src1->data), static_cast<float *>(dst->data), k, rows,
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], src1->nb[2], src1->nb[3],
+                nb02_dst, nb03_dst, dst->nb[0], head_ratio, batch_ratio);
+        } else if (grouped_kqv) {
+            ggml_cuda_kernel_launch(mul_mat_vec_kepler_attn_kqv_gqa2<half>, launch_params, x,
+                static_cast<const float *>(src1->data), static_cast<float *>(dst->data), k,
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], src1->nb[2], src1->nb[3],
+                nb02_dst, nb03_dst, dst->nb[0], batch_ratio);
+        } else {
+            ggml_cuda_kernel_launch(mul_mat_vec_kepler_attn_kqv<half>, launch_params, x,
+                static_cast<const float *>(src1->data), static_cast<float *>(dst->data), k,
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], src1->nb[2], src1->nb[3],
+                nb02_dst, nb03_dst, dst->nb[0], head_ratio, batch_ratio);
+        }
+    } else {
+        const float * x = static_cast<const float *>(src0->data);
+        if (kq) {
+            ggml_cuda_kernel_launch(mul_mat_vec_kepler_attn_kq<float>, launch_params, x,
+                static_cast<const float *>(src1->data), static_cast<float *>(dst->data), k, rows,
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], src1->nb[2], src1->nb[3],
+                nb02_dst, nb03_dst, dst->nb[0], head_ratio, batch_ratio);
+        } else if (grouped_kqv) {
+            ggml_cuda_kernel_launch(mul_mat_vec_kepler_attn_kqv_gqa2<float>, launch_params, x,
+                static_cast<const float *>(src1->data), static_cast<float *>(dst->data), k,
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], src1->nb[2], src1->nb[3],
+                nb02_dst, nb03_dst, dst->nb[0], batch_ratio);
+        } else {
+            ggml_cuda_kernel_launch(mul_mat_vec_kepler_attn_kqv<float>, launch_params, x,
+                static_cast<const float *>(src1->data), static_cast<float *>(dst->data), k,
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], src1->nb[2], src1->nb[3],
+                nb02_dst, nb03_dst, dst->nb[0], head_ratio, batch_ratio);
+        }
+    }
+    return true;
 #endif
 }
