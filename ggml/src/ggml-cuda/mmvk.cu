@@ -2538,6 +2538,185 @@ static void launch_mmvk_q8_0_ws(
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
 }
 
+// Q5_0 (22-byte blocks: half d, 32 high bits qh, 16 bytes of nibbles; weight j < 16 is the low nibble of
+// qs[j], weight j + 16 the high nibble, high bit of weight w is bit w of qh; value = (5-bit - 16) * d).
+// Same structure as Q8_0 ws (2026-11-21, Claude): a warp streams one row, 4 consecutive blocks (88 B) per
+// step, U steps in flight, y in 4 KB shared tiles. Lane (bo = lane / 8, g = lane % 8) handles weights
+// 4g..4g+3 of block bo: nibble word qs[4(g&3)..] (low nibbles for g < 4, high for g >= 4) and qh bits 4g..4g+3.
+// SHFL (rows 4-byte aligned, nb even): a step is 22 aligned words, one load per lane (lanes 0-21), fields
+// gathered by shuffle; otherwise 16-bit loads (any 2-byte alignment).
+static __device__ __forceinline__ float q5_0_dot4_bias(const uint32_t q, const float4 y) {
+    // q holds four unsigned 5-bit values (0..31), one per byte; value - 16 via the magic-number float trick
+    uint32_t u_ff;
+    asm("or.b32 %0, %1, 0xff000000;" : "=r"(u_ff) : "r"(q));
+    const float q0 = __fadd_rn(__uint_as_float(u_ff & 0x4B0000FFu), -8388624.0f);   // 2^23 + 16
+    const float q1 = __fadd_rn(__uint_as_float(u_ff & 0x4700FF00u), -32784.0f);     // 2^15 + 16
+    asm("or.b32 %0, %1, 0xff000000;" : "=r"(u_ff) : "r"(q >> 16));
+    const float q2 = __fadd_rn(__uint_as_float(u_ff & 0x4B0000FFu), -8388624.0f);
+    const float q3 = __fadd_rn(__uint_as_float(u_ff & 0x4700FF00u), -32784.0f);
+    const float sum02 = fmaf(q2, y.z, q0 * y.x);
+    const float sum13 = fmaf(q3, y.w, q1 * y.y);
+    return sum02 + sum13;
+}
+
+static __device__ __forceinline__ uint32_t q5_0_quads(const uint32_t qsw, const uint32_t qh, const int g) {
+    const uint32_t nib = (g < 4 ? qsw : (qsw >> 4)) & 0x0F0F0F0Fu;
+    const uint32_t h = (qh >> (4 * g)) & 0xFu;
+    const uint32_t hb = ((h & 1u) << 4) | ((h & 2u) << 11) | ((h & 4u) << 18) | ((h & 8u) << 25);
+    return nib | hb;
+}
+
+template <int U, bool SHFL>
+__launch_bounds__(128, 1)
+static __global__ void mul_mat_vec_q5_0_kepler_ws(
+        const block_q5_0 * __restrict__ vx,
+        const float * __restrict__ vy,
+        float * __restrict__ dst,
+        const int nb,
+        const int nrows,
+        const int64_t stride_row_x,
+        const uint3 channel_ratio,
+        const int64_t stride_channel_x,
+        const int64_t stride_channel_y,
+        const int64_t stride_channel_dst,
+        const uint3 sample_ratio,
+        const int64_t stride_sample_x,
+        const int64_t stride_sample_y,
+        const int64_t stride_sample_dst) {
+    static_assert(sizeof(block_q5_0) == 22, "unexpected block_q5_0 size");
+    constexpr int WARPS = 4;
+    constexpr int RPW = 4;
+    constexpr int RPB = WARPS * RPW;
+    constexpr int TILE_B = 32;
+    constexpr int BS = (int) sizeof(block_q5_0);
+    __shared__ float4 ys[TILE_B * QK5_0 / 4];
+
+    const int tid  = threadIdx.y * WARP_SIZE + threadIdx.x;
+    const int lane = threadIdx.x;
+    const int bo   = lane >> 3;
+    const int g    = lane & 7;
+
+    const uint32_t channel_x = fastdiv(blockIdx.y, channel_ratio);
+    const uint32_t sample_x  = fastdiv(blockIdx.z, sample_ratio);
+    const block_q5_0 * x_base = vx + sample_x * stride_sample_x + channel_x * stride_channel_x;
+    const float4 * y4 = reinterpret_cast<const float4 *>(vy + blockIdx.z * stride_sample_y + blockIdx.y * stride_channel_y);
+    const int row0 = blockIdx.x * RPB + threadIdx.y * RPW;
+
+    // byte offsets inside a 4-block step for my fields (SHFL path)
+    const int o_d  = BS * bo;                  // scale (2 B)
+    const int o_qh = BS * bo + 2;              // high bits (4 B)
+    const int o_qs = BS * bo + 6 + 4 * (g & 3);// my nibble word (4 B)
+
+    float acc[RPW];
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        acc[r] = 0.0f;
+    }
+
+    for (int tb = 0; tb < nb; tb += TILE_B) {
+        const int tn = min(TILE_B, nb - tb);
+        __syncthreads();
+        for (int i = tid; i < tn * (QK5_0 / 4); i += WARPS * WARP_SIZE) {
+            ys[i] = y4[tb * (QK5_0 / 4) + i];
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int r = 0; r < RPW; ++r) {
+            const int row = row0 + r;
+            if (row < nrows) {
+                const block_q5_0 * xr = x_base + row * stride_row_x + tb;
+                for (int ib = 0; ib < tn; ib += 4 * U) {
+                    uint32_t q[U];
+                    float    d[U];
+                    if constexpr (SHFL) {
+                        uint32_t w[U];
+#pragma unroll
+                        for (int u = 0; u < U; ++u) {
+                            const int b0 = ib + 4 * u;
+                            const int nw = b0 < tn ? (min(4, tn - b0) * BS) / 4 : 0;   // 11 or 22 words
+                            w[u] = lane < nw ? reinterpret_cast<const uint32_t *>(xr + b0)[lane] : 0u;
+                        }
+#pragma unroll
+                        for (int u = 0; u < U; ++u) {
+                            const uint32_t dwv = __shfl_sync(0xffffffffu, w[u], o_d >> 2);
+                            const uint32_t h0  = __shfl_sync(0xffffffffu, w[u], o_qh >> 2);
+                            const uint32_t h1  = __shfl_sync(0xffffffffu, w[u], ((o_qh >> 2) + 1) & 31);
+                            const uint32_t s0  = __shfl_sync(0xffffffffu, w[u], o_qs >> 2);
+                            const uint32_t s1  = __shfl_sync(0xffffffffu, w[u], ((o_qs >> 2) + 1) & 31);
+                            const bool mis = (o_qs & 2) != 0;    // even bo: qh and qs start 2 bytes into a word
+                            const uint32_t qh  = mis ? __byte_perm(h0, h1, 0x5432u) : h0;
+                            const uint32_t qsw = mis ? __byte_perm(s0, s1, 0x5432u) : s0;
+                            const uint16_t dbits = (o_d & 2) ? static_cast<uint16_t>(dwv >> 16) : static_cast<uint16_t>(dwv & 0xffffu);
+                            half dh;
+                            memcpy(&dh, &dbits, sizeof(dh));
+                            d[u] = __half2float(dh);
+                            q[u] = q5_0_quads(qsw, qh, g);
+                        }
+                    } else {
+#pragma unroll
+                        for (int u = 0; u < U; ++u) {
+                            const int b = ib + 4 * u + bo;
+                            if (b < tn) {
+                                const uint16_t * p = reinterpret_cast<const uint16_t *>(xr + b);
+                                half dh;
+                                memcpy(&dh, p, sizeof(dh));
+                                d[u] = __half2float(dh);
+                                const uint32_t qh  = static_cast<uint32_t>(p[1]) | (static_cast<uint32_t>(p[2]) << 16);
+                                const uint32_t qsw = static_cast<uint32_t>(p[3 + 2 * (g & 3)]) | (static_cast<uint32_t>(p[4 + 2 * (g & 3)]) << 16);
+                                q[u] = q5_0_quads(qsw, qh, g);
+                            } else {
+                                d[u] = 0.0f;
+                                q[u] = 0u;
+                            }
+                        }
+                    }
+#pragma unroll
+                    for (int u = 0; u < U; ++u) {
+                        const int b = ib + 4 * u + bo;
+                        if (b < tn) {
+                            acc[r] = fmaf(d[u], q5_0_dot4_bias(q[u], ys[b * (QK5_0 / 4) + g]), acc[r]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    float * dst_base = dst + blockIdx.z * stride_sample_dst + blockIdx.y * stride_channel_dst;
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        float v = acc[r];
+#pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            v += __shfl_xor_sync(0xffffffffu, v, offset, WARP_SIZE);
+        }
+        if (lane == 0 && row0 + r < nrows) {
+            dst_base[row0 + r] = v;
+        }
+    }
+}
+
+template <bool SHFL>
+static void launch_mmvk_q5_0_ws(
+        const block_q5_0 * src0_d, const float * src1_d, float * dst_d,
+        const int nb, const int nrows, const int64_t stride_row_x,
+        const uint3 channel_ratio, const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
+        const uint3 sample_ratio, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
+        const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    constexpr int ROWS_PER_BLOCK = 16;
+    const unsigned int nblocks_x = static_cast<unsigned int>((static_cast<int64_t>(nrows) + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    const dim3 block_nums(nblocks_x, static_cast<unsigned int>(ne2), static_cast<unsigned int>(ne3));
+    const dim3 block_dims(WARP_SIZE, 4, 1);
+    const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
+
+    ggml_cuda_kernel_launch(
+        mul_mat_vec_q5_0_kepler_ws<SHFL ? 2 : 4, SHFL>, launch_params,   // SHFL at U 4 spilled 32 B
+        src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+}
+
 static void launch_mmvk_q4_k_vk(
         const block_q4_K * src0_d, const float * src1_d, float * dst_d,
         const int nb, const int nrows, const int64_t stride_row_x,
@@ -2813,7 +2992,8 @@ static bool ggml_cuda_mmvk_shape_supported(const ggml_tensor * src0, const ggml_
     if (src0 == nullptr || src1 == nullptr || dst == nullptr) {
         return false;
     }
-    if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_Q8_0) {
+    if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_Q8_0 &&
+            src0->type != GGML_TYPE_Q5_0) {
         return false;
     }
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
@@ -2875,7 +3055,7 @@ static bool ggml_cuda_mmvk_shape_supported(const ggml_tensor * src0, const ggml_
     }
 
     // Q4_K uses uint4 (16-byte aligned; sizeof(block_q4_K) == 144 is multiple of 16).
-    // Q6_K and Q8_0 use 2-byte-aligned block loads.
+    // Q6_K, Q8_0 and Q5_0 use 2-byte-aligned block loads.
     const size_t req_align_src0 = (src0->type == GGML_TYPE_Q4_K) ? 16 : 2;
     if ((reinterpret_cast<uintptr_t>(src0->data) % req_align_src0) != 0) {
         return false;
@@ -3136,6 +3316,31 @@ bool ggml_cuda_mul_mat_vec_kepler(
                         dst->ne[2], dst->ne[3], stream);
                 }
                 break;
+        }
+        return true;
+    }
+
+    if (src0->type == GGML_TYPE_Q5_0) {
+        const block_q5_0 * src0_d = static_cast<const block_q5_0 *>(src0->data);
+        const bool q5_even_pairs_ok = (nb > 0)
+            && ((nb & 1) == 0)
+            && ((stride_row_x & 1) == 0)
+            && ((reinterpret_cast<uintptr_t>(src0_d) & 3u) == 0u)
+            && (src0->ne[2] == 1 || (stride_channel_x & 1) == 0)
+            && (src0->ne[3] == 1 || (stride_sample_x & 1) == 0);
+        static const bool q5_noshfl = std::getenv("GGML_CUDA_KEPLER_MMV_Q5_NOSHFL") != nullptr;
+        if (q5_even_pairs_ok && !q5_noshfl) {
+            launch_mmvk_q5_0_ws<true>(
+                src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
+                dst->ne[2], dst->ne[3], stream);
+        } else {
+            launch_mmvk_q5_0_ws<false>(
+                src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
+                dst->ne[2], dst->ne[3], stream);
         }
         return true;
     }
