@@ -1,7 +1,9 @@
 #include "mmvk.cuh"
 
 #include <atomic>
+#include <array>
 #include <cctype>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -63,7 +65,7 @@ static void mmvk_trace_stock(const ggml_type type, const char * reason, const in
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 // Selectable Kepler (sm_30) launch geometries:
-// - GGML_CUDA_KEPLER_MMV_Q3K: "auto" (d32 on even block pairs, d32o otherwise when aligned), "d32", "d32o", "pl2", "pl", "off" (stock)
+// - GGML_CUDA_KEPLER_MMV_Q3K: "auto" (d32 on even block pairs, d32o otherwise when aligned), "d32", "d32o", "d32c2t", "d32c4r4t", "pl2", "pl", "off" (stock)
 //   ne11 = 2..8 (r21, speculative-decoding verify): d32c<2> per pair of columns, d32o for an odd last column,
 //   whatever the variant except "off"
 // - GGML_CUDA_KEPLER_MMV_Q4K: "auto", "vk2", "sy"
@@ -1254,7 +1256,7 @@ static __global__ void mul_mat_vec_q3_K_kepler_d32o(
     }
 }
 
-template <int NCOLS>
+template <int NCOLS, bool USE_TEXTURE = false>
 __launch_bounds__(128)
 static __global__ void mul_mat_vec_q3_K_kepler_d32c(
         const block_q3_K * __restrict__ vx,
@@ -1272,6 +1274,8 @@ static __global__ void mul_mat_vec_q3_K_kepler_d32c(
         const uint3 sample_ratio,
         const int64_t stride_sample_x,
         const int64_t stride_sample_y,
+        const cudaTextureObject_t y_texture,
+        const int y_off,
         const int64_t stride_sample_dst) {
     constexpr int ROWS_PER_WARP = 2;
     constexpr int ROWS_PER_BLOCK = 4 * ROWS_PER_WARP;
@@ -1305,8 +1309,18 @@ static __global__ void mul_mat_vec_q3_K_kepler_d32c(
         for (int col = 0; col < NCOLS; ++col) {
             const float4 * y4 = reinterpret_cast<const float4 *>(y_base + col * stride_column_y
                 + QK_K * ib + 32 * (2 * (lane >> 3)) + 4 * (lane & 7));
-            acc0[col] = q3_k_d32_dot8(w0, dsc01, 0, y4[0], y4[8], lane, acc0[col]);
-            acc1[col] = q3_k_d32_dot8(w1, dsc01, 16, y4[0], y4[8], lane, acc1[col]);
+            float4 y0;
+            float4 y1;
+            if constexpr (USE_TEXTURE) {
+                const int index = y_off + static_cast<int>(y4 - reinterpret_cast<const float4 *>(vy));
+                y0 = tex1Dfetch<float4>(y_texture, index);
+                y1 = tex1Dfetch<float4>(y_texture, index + 8);
+            } else {
+                y0 = y4[0];
+                y1 = y4[8];
+            }
+            acc0[col] = q3_k_d32_dot8(w0, dsc01, 0, y0, y1, lane, acc0[col]);
+            acc1[col] = q3_k_d32_dot8(w1, dsc01, 16, y0, y1, lane, acc1[col]);
         }
         x_ptr0 += sizeof(block_q3_K);
         x_ptr1 += sizeof(block_q3_K);
@@ -1318,6 +1332,98 @@ static __global__ void mul_mat_vec_q3_K_kepler_d32c(
             float * dst_base = dst + blockIdx.z * stride_sample_dst + blockIdx.y * stride_channel_dst;
             dst_base[first_row + lane + col * stride_column_dst] = sums;
         }
+    }
+}
+
+__launch_bounds__(128)
+static __global__ void mul_mat_vec_q3_K_kepler_d32c4r4t(
+        const block_q3_K * __restrict__ vx,
+        const float * __restrict__ vy,
+        float * __restrict__ dst,
+        const int nb,
+        const int nrows,
+        const int64_t stride_row_x,
+        const int64_t stride_column_y,
+        const int64_t stride_column_dst,
+        const uint3 channel_ratio,
+        const int64_t stride_channel_x,
+        const int64_t stride_channel_y,
+        const int64_t stride_channel_dst,
+        const uint3 sample_ratio,
+        const int64_t stride_sample_x,
+        const int64_t stride_sample_y,
+        const int64_t stride_sample_dst,
+        const cudaTextureObject_t y_texture,
+        const int y_off) {
+    constexpr int ROWS_PER_WARP = 4;
+    constexpr int ROWS_PER_BLOCK = 4 * ROWS_PER_WARP;
+    const int first_row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y * ROWS_PER_WARP;
+    if (first_row >= nrows) return;
+    const uint32_t channel_x = fastdiv(blockIdx.y, channel_ratio);
+    const uint32_t sample_x = fastdiv(blockIdx.z, sample_ratio);
+    const block_q3_K * x_base = vx + sample_x * stride_sample_x + channel_x * stride_channel_x;
+    const float * y_base = vy + blockIdx.z * stride_sample_y + blockIdx.y * stride_channel_y;
+    const uint8_t * x_ptr0 = reinterpret_cast<const uint8_t *>(x_base + static_cast<int64_t>(min(first_row, nrows - 1)) * stride_row_x);
+    const uint8_t * x_ptr1 = reinterpret_cast<const uint8_t *>(x_base + static_cast<int64_t>(min(first_row + 1, nrows - 1)) * stride_row_x);
+    const uint8_t * x_ptr2 = reinterpret_cast<const uint8_t *>(x_base + static_cast<int64_t>(min(first_row + 2, nrows - 1)) * stride_row_x);
+    const uint8_t * x_ptr3 = reinterpret_cast<const uint8_t *>(x_base + static_cast<int64_t>(min(first_row + 3, nrows - 1)) * stride_row_x);
+    const int lane = threadIdx.x;
+    float acc00 = 0.0f, acc01 = 0.0f, acc02 = 0.0f, acc03 = 0.0f;
+    float acc10 = 0.0f, acc11 = 0.0f, acc12 = 0.0f, acc13 = 0.0f;
+#pragma unroll 1
+    for (int ib = 0; ib < nb; ++ib) {
+        const bool mis0 = (reinterpret_cast<uintptr_t>(x_ptr0) & 2u) != 0;
+        const bool mis1 = (reinterpret_cast<uintptr_t>(x_ptr1) & 2u) != 0;
+        const bool mis2 = (reinterpret_cast<uintptr_t>(x_ptr2) & 2u) != 0;
+        const bool mis3 = (reinterpret_cast<uintptr_t>(x_ptr3) & 2u) != 0;
+        const uint32_t * p0 = reinterpret_cast<const uint32_t *>(x_ptr0 - (mis0 ? 2 : 0));
+        const uint32_t * p1 = reinterpret_cast<const uint32_t *>(x_ptr1 - (mis1 ? 2 : 0));
+        const uint32_t * p2 = reinterpret_cast<const uint32_t *>(x_ptr2 - (mis2 ? 2 : 0));
+        const uint32_t * p3 = reinterpret_cast<const uint32_t *>(x_ptr3 - (mis3 ? 2 : 0));
+        uint32_t r0 = lane < (mis0 ? 28 : 27) ? p0[lane] : 0u;
+        uint32_t r1 = lane < (mis1 ? 28 : 27) ? p1[lane] : 0u;
+        uint32_t r2 = lane < (mis2 ? 28 : 27) ? p2[lane] : 0u;
+        uint32_t r3 = lane < (mis3 ? 28 : 27) ? p3[lane] : 0u;
+        if (lane == 27 && !mis0) r0 = static_cast<uint32_t>(*reinterpret_cast<const uint16_t *>(x_ptr0 + 108)) << 16;
+        if (lane == 27 && !mis1) r1 = static_cast<uint32_t>(*reinterpret_cast<const uint16_t *>(x_ptr1 + 108)) << 16;
+        if (lane == 27 && !mis2) r2 = static_cast<uint32_t>(*reinterpret_cast<const uint16_t *>(x_ptr2 + 108)) << 16;
+        if (lane == 27 && !mis3) r3 = static_cast<uint32_t>(*reinterpret_cast<const uint16_t *>(x_ptr3 + 108)) << 16;
+        const uint32_t w0 = mis0 ? __byte_perm(r0, __shfl_down_sync(0xffffffffu, r0, 1), 0x5432u) : r0;
+        const uint32_t w1 = mis1 ? __byte_perm(r1, __shfl_down_sync(0xffffffffu, r1, 1), 0x5432u) : r1;
+        const uint32_t w2 = mis2 ? __byte_perm(r2, __shfl_down_sync(0xffffffffu, r2, 1), 0x5432u) : r2;
+        const uint32_t w3 = mis3 ? __byte_perm(r3, __shfl_down_sync(0xffffffffu, r3, 1), 0x5432u) : r3;
+        const float dsc01 = q3_k_decode_dsc_pair_d32<true>(r0, r1, w0, w1, lane);
+        const float dsc23 = q3_k_decode_dsc_pair_d32<true>(r2, r3, w2, w3, lane);
+#pragma unroll
+        for (int col = 0; col < 2; ++col) {
+            const float4 * y4 = reinterpret_cast<const float4 *>(y_base + col * stride_column_y
+                + QK_K * ib + 32 * (2 * (lane >> 3)) + 4 * (lane & 7));
+            const int index = y_off + static_cast<int>(y4 - reinterpret_cast<const float4 *>(vy));
+            const float4 y0 = tex1Dfetch<float4>(y_texture, index);
+            const float4 y1 = tex1Dfetch<float4>(y_texture, index + 8);
+            if (col == 0) {
+                acc00 = q3_k_d32_dot8(w0, dsc01, 0, y0, y1, lane, acc00);
+                acc01 = q3_k_d32_dot8(w1, dsc01, 16, y0, y1, lane, acc01);
+                acc02 = q3_k_d32_dot8(w2, dsc23, 0, y0, y1, lane, acc02);
+                acc03 = q3_k_d32_dot8(w3, dsc23, 16, y0, y1, lane, acc03);
+            } else {
+                acc10 = q3_k_d32_dot8(w0, dsc01, 0, y0, y1, lane, acc10);
+                acc11 = q3_k_d32_dot8(w1, dsc01, 16, y0, y1, lane, acc11);
+                acc12 = q3_k_d32_dot8(w2, dsc23, 0, y0, y1, lane, acc12);
+                acc13 = q3_k_d32_dot8(w3, dsc23, 16, y0, y1, lane, acc13);
+            }
+        }
+        x_ptr0 += sizeof(block_q3_K);
+        x_ptr1 += sizeof(block_q3_K);
+        x_ptr2 += sizeof(block_q3_K);
+        x_ptr3 += sizeof(block_q3_K);
+    }
+    const float sums0 = warp_reduce_sum_4rows_packed(acc00, acc01, acc02, acc03, lane);
+    const float sums1 = warp_reduce_sum_4rows_packed(acc10, acc11, acc12, acc13, lane);
+    if (lane < ROWS_PER_WARP && first_row + lane < nrows) {
+        float * dst_base = dst + blockIdx.z * stride_sample_dst + blockIdx.y * stride_channel_dst;
+        dst_base[first_row + lane] = sums0;
+        dst_base[first_row + lane + stride_column_dst] = sums1;
     }
 }
 
@@ -1607,15 +1713,83 @@ static void launch_mmvk_q3_k_d32o(
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
 }
 
-template <int NCOLS>
+struct mmvk_texture_entry {
+    const void * base = nullptr;
+    size_t bytes = 0;
+    cudaTextureObject_t object = 0;
+};
+
+static bool mmvk_q3k_texture(const float * ptr, const size_t extent_bytes, cudaTextureObject_t & object, int & y_off) {
+    static std::mutex mutex;
+    static std::array<mmvk_texture_entry, 64> entries{};
+    static size_t next_entry = 0;
+    static const size_t alignment = []() {
+        int device = 0;
+        cudaDeviceProp prop{};
+        CUDA_CHECK(cudaGetDevice(&device));
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+        return prop.textureAlignment;
+    }();
+    const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
+    if (alignment == 0 || extent_bytes == 0 || ((address | extent_bytes) & 15u) != 0
+            || extent_bytes / sizeof(float4) > (1u << 27)) {
+        return false;
+    }
+    const uintptr_t base_address = address - address % alignment;
+    const size_t offset_bytes = static_cast<size_t>(address - base_address);
+    if (offset_bytes / sizeof(float4) > static_cast<size_t>(INT_MAX)
+            || extent_bytes > SIZE_MAX - offset_bytes) {
+        return false;
+    }
+    const size_t bytes = offset_bytes + extent_bytes;
+    if (bytes / sizeof(float4) > (1u << 27)) {
+        return false;
+    }
+    const void * base = reinterpret_cast<const void *>(base_address);
+    std::lock_guard<std::mutex> lock(mutex);
+    for (const auto & entry : entries) {
+        if (entry.object != 0 && entry.base == base && entry.bytes == bytes) {
+            object = entry.object;
+            y_off = static_cast<int>(offset_bytes / sizeof(float4));
+            return true;
+        }
+    }
+    cudaResourceDesc resource{};
+    resource.resType = cudaResourceTypeLinear;
+    resource.res.linear.devPtr = const_cast<void *>(base);
+    resource.res.linear.desc = cudaCreateChannelDesc<float4>();
+    resource.res.linear.sizeInBytes = bytes;
+    cudaTextureDesc texture{};
+    texture.readMode = cudaReadModeElementType;
+    cudaTextureObject_t created = 0;
+    if (cudaCreateTextureObject(&created, &resource, &texture, nullptr) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    mmvk_texture_entry & entry = entries[next_entry];
+    next_entry = (next_entry + 1) % entries.size();
+    if (entry.object != 0) {
+        // cudaDestroyTextureObject is not stream-ordered: a queued kernel may still read this texture. Evictions are
+        // rare with 64 entries (graph buffers are reused across tokens), so wait for the device first.
+        (void) cudaDeviceSynchronize();
+        (void) cudaDestroyTextureObject(entry.object);
+    }
+    entry = { base, bytes, created };
+    object = created;
+    y_off = static_cast<int>(offset_bytes / sizeof(float4));
+    return true;
+}
+
+template <int NCOLS, bool USE_TEXTURE = false>
 static void launch_mmvk_q3_k_d32c(
         const block_q3_K * src0_d, const float * src1_d, float * dst_d,
         const int nb, const int nrows, const int64_t stride_row_x,
         const int64_t stride_column_y, const int64_t stride_column_dst,
         const uint3 channel_ratio, const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
         const uint3 sample_ratio, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
-        const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
-    const char * kernel = "d32c2";
+        const int64_t ne2, const int64_t ne3, cudaStream_t stream,
+        const cudaTextureObject_t y_texture = 0, const int y_off = 0) {
+    const char * kernel = USE_TEXTURE ? "d32c2t" : "d32c2";
     mmvk_trace(GGML_TYPE_Q3_K, kernel, nrows, static_cast<int64_t>(nb) * QK_K);
     constexpr int rows_per_block = 8;
     const unsigned int nblocks_x = static_cast<unsigned int>((static_cast<int64_t>(nrows) + rows_per_block - 1) / rows_per_block);
@@ -1623,12 +1797,35 @@ static void launch_mmvk_q3_k_d32c(
     const dim3 block_dims(WARP_SIZE, 4, 1);
     const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
     ggml_cuda_kernel_launch(
-        mul_mat_vec_q3_K_kepler_d32c<NCOLS>,
+        mul_mat_vec_q3_K_kepler_d32c<NCOLS, USE_TEXTURE>,
         launch_params,
         src0_d, src1_d, dst_d,
         nb, nrows, stride_row_x, stride_column_y, stride_column_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+        sample_ratio, stride_sample_x, stride_sample_y, y_texture, y_off, stride_sample_dst);
+}
+
+static void launch_mmvk_q3_k_d32c4r4t(
+        const block_q3_K * src0_d, const float * src1_d, float * dst_d,
+        const int nb, const int nrows, const int64_t stride_row_x,
+        const int64_t stride_column_y, const int64_t stride_column_dst,
+        const uint3 channel_ratio, const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
+        const uint3 sample_ratio, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
+        const int64_t ne2, const int64_t ne3, cudaStream_t stream,
+        const cudaTextureObject_t texture, const int y_off) {
+    mmvk_trace(GGML_TYPE_Q3_K, "d32c4r4t", nrows, static_cast<int64_t>(nb) * QK_K);
+    constexpr int rows_per_block = 16;
+    const unsigned int nblocks_x = static_cast<unsigned int>((static_cast<int64_t>(nrows) + rows_per_block - 1) / rows_per_block);
+    const dim3 block_nums(nblocks_x, static_cast<unsigned int>(ne2), static_cast<unsigned int>(ne3));
+    const dim3 block_dims(WARP_SIZE, 4, 1);
+    const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
+    ggml_cuda_kernel_launch(
+        mul_mat_vec_q3_K_kepler_d32c4r4t,
+        launch_params,
+        src0_d, src1_d, dst_d,
+        nb, nrows, stride_row_x, stride_column_y, stride_column_dst,
+        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, texture, y_off);
 }
 
 static void launch_mmvk_q4_k_vk2(
@@ -2990,9 +3187,44 @@ bool ggml_cuda_mul_mat_vec_kepler(
                 const float * y_col = src1_d + col * stride_column_y;
                 float * dst_col = dst_d + col * stride_column_dst;
                 if (remaining >= 2) {
-                    launch_mmvk_q3_k_d32c<2>(src0_d, y_col, dst_col, nb, nrows, stride_row_x,
-                        stride_column_y, stride_column_dst, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, dst->ne[2], dst->ne[3], stream);
+                    // r24: auto = d32c4r4t (y through the texture cache, 4 rows x 2 columns, 74 us/col at
+                    // 2048x2048 vs d32c<2> 90); "d32c2" selects the plain global-y kernel, "d32c2t" the 2-row one
+                    const bool want_plain = variant != nullptr && std::strcmp(variant, "d32c2") == 0;
+                    const bool use_texture = !want_plain;
+                    bool launched_texture = false;
+                    if (use_texture) {
+                        const uint64_t extent_floats = static_cast<uint64_t>(dst->ne[3] - 1) * stride_sample_y
+                            + static_cast<uint64_t>(dst->ne[2] - 1) * stride_channel_y
+                            + static_cast<uint64_t>(2 - 1) * stride_column_y + static_cast<uint64_t>(nb) * QK_K;
+                        cudaTextureObject_t texture = 0;
+                        int y_off = 0;
+                        if (extent_floats <= SIZE_MAX / sizeof(float)
+                                && mmvk_q3k_texture(y_col, static_cast<size_t>(extent_floats) * sizeof(float), texture, y_off)) {
+                            if (variant == nullptr || std::strcmp(variant, "d32c2t") != 0) {
+                                launch_mmvk_q3_k_d32c4r4t(src0_d, y_col, dst_col, nb, nrows, stride_row_x,
+                                    stride_column_y, stride_column_dst, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                                    sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, dst->ne[2], dst->ne[3], stream,
+                                    texture, y_off);
+                            } else {
+                                launch_mmvk_q3_k_d32c<2, true>(src0_d, y_col, dst_col, nb, nrows, stride_row_x,
+                                    stride_column_y, stride_column_dst, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                                    sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, dst->ne[2], dst->ne[3], stream,
+                                    texture, y_off);
+                            }
+                            launched_texture = true;
+                        }
+                        if (!launched_texture && mmvk_trace_enabled()) {
+                            static std::atomic<bool> warned{false};
+                            if (!warned.exchange(true)) {
+                                std::fprintf(stderr, "KEPLER_TRACE type=Q3_K kernel=d32c2t-fallback\n");
+                            }
+                        }
+                    }
+                    if (!launched_texture) {
+                        launch_mmvk_q3_k_d32c<2>(src0_d, y_col, dst_col, nb, nrows, stride_row_x,
+                            stride_column_y, stride_column_dst, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, dst->ne[2], dst->ne[3], stream);
+                    }
                     col += 2;
                 } else {
                     launch_mmvk_q3_k_d32o(src0_d, y_col, dst_col, nb, nrows, stride_row_x,
@@ -3041,13 +3273,17 @@ bool ggml_cuda_mul_mat_vec_kepler(
             }
             return true;
         }
-        if ((variant == nullptr || std::strcmp(variant, "auto") == 0) && q3_even_pairs_ok) {
+        // the multi-column variant names select only the n > 1 path; n = 1 then behaves as "auto" (r24: selecting
+        // d32c4r4t used to send n = 1 to pl, halving Qwen3-1.7B decode in the test loop)
+        const bool q3_auto = variant == nullptr || std::strcmp(variant, "auto") == 0 || std::strcmp(variant, "d32c2") == 0
+            || std::strcmp(variant, "d32c2t") == 0 || std::strcmp(variant, "d32c4r4t") == 0;
+        if (q3_auto && q3_even_pairs_ok) {
             launch_mmvk_q3_k_d32(
                 src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
                 dst->ne[2], dst->ne[3], stream);
-        } else if ((variant == nullptr || std::strcmp(variant, "auto") == 0) && q3_d32o_ok) {
+        } else if (q3_auto && q3_d32o_ok) {
             launch_mmvk_q3_k_d32o(
                 src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
