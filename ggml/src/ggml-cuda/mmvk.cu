@@ -65,7 +65,7 @@ static void mmvk_trace_stock(const ggml_type type, const char * reason, const in
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 // Selectable Kepler (sm_30) launch geometries:
-// - GGML_CUDA_KEPLER_MMV_Q3K: "auto" (d32 on even block pairs, d32o otherwise when aligned), "d32", "d32o", "d32c2t", "d32c4r4t", "pl2", "pl", "off" (stock)
+// - GGML_CUDA_KEPLER_MMV_Q3K: "auto" (d32s on even block pairs, d32o otherwise when aligned), "d32", "d32o", "d32s", "d32c2t", "d32c4r4t", "pl2", "pl", "off" (stock)
 //   ne11 = 2..8 (r21, speculative-decoding verify): d32c<2> per pair of columns, d32o for an odd last column,
 //   whatever the variant except "off"
 // - GGML_CUDA_KEPLER_MMV_Q4K: "auto", "vk2", "sy"
@@ -1084,6 +1084,43 @@ static __device__ __forceinline__ float q3_k_d32_dot8(
     return acc;
 }
 
+template <bool IS_ODD>
+static __device__ __forceinline__ float2 q3_k_d32_decode_d_pair_odd(
+        const uint32_t wa_raw, const uint32_t wb_raw) {
+    const uint32_t da = IS_ODD ? wa_raw >> 16 : wa_raw & 0xffffu;
+    const uint32_t db = IS_ODD ? wb_raw >> 16 : wb_raw & 0xffffu;
+    const uint32_t packed = __shfl_sync(0xffffffffu, da | (db << 16), 27);
+    half2 d_h2;
+    memcpy(&d_h2, &packed, sizeof(d_h2));
+    return __half22float2(d_h2);
+}
+
+static __device__ __forceinline__ float q3_k_d32_dot8_direct(
+        const uint32_t w, const float d_row,
+        const float4 y0, const float4 y1, const int lane, float acc) {
+    const int m0 = 2 * (lane >> 3);
+    const int c = lane & 7;
+    const int qsw_src = 8 + ((lane & 16) >> 1) + c;
+    const int qsw_sh = (lane & 8) >> 1;
+    const uint32_t hm = __shfl_sync(0xffffffffu, w, c) >> m0;
+    const uint32_t qsw = __shfl_sync(0xffffffffu, w, qsw_src) >> qsw_sh;
+    const uint32_t a01_src = 24 + ((lane >> 3) & 1);
+    const uint32_t a01 = __shfl_sync(0xffffffffu, w, a01_src);
+    const uint32_t a2 = __shfl_sync(0xffffffffu, w, 26);
+    const uint32_t byte_sh = (lane & 4) << 1;
+    const uint32_t lo_sh = (lane & 16) >> 2;
+    const uint32_t hi_sh = (lane >> 3) << 1;
+    const uint32_t sw = ((a01 >> (byte_sh + lo_sh)) & 0x000f000fu)
+        | (((a2 >> (byte_sh + hi_sh)) & 0x00030003u) << 4);
+    const float sc0 = __fadd_rn(__uint_as_float((sw & 0x0000003fu) | 0x4b000000u), -8388640.0f);
+    const float sc1 = __fadd_rn(__uint_as_float((sw & 0x003f0000u) | 0x43000000u), -160.0f);
+    const uint32_t q0 = (qsw & 0x03030303u) | ((hm & 0x01010101u) << 2);
+    const uint32_t q1 = ((qsw >> 2) & 0x03030303u) | ((hm & 0x02020202u) << 1);
+    const float blk = fmaf(dot4_u3_bias(q1, y1), sc1, dot4_u3_bias(q0, y0) * sc0);
+    return fmaf(blk, d_row, acc);
+}
+
+template <bool DIRECT = false>
 __launch_bounds__(128)
 static __global__ void mul_mat_vec_q3_K_kepler_d32(
         const block_q3_K * __restrict__ vx,
@@ -1136,12 +1173,21 @@ static __global__ void mul_mat_vec_q3_K_kepler_d32(
         const uint32_t w1_even = q3_k_stitch_d32<false>(w1_even_raw);
         const uint32_t w2_even = q3_k_stitch_d32<false>(w2_even_raw);
         const uint32_t w3_even = q3_k_stitch_d32<false>(w3_even_raw);
-        const float dsc01_even = q3_k_decode_dsc_pair_d32<false>(w0_even_raw, w1_even_raw, w0_even, w1_even, lane);
-        const float dsc23_even = q3_k_decode_dsc_pair_d32<false>(w2_even_raw, w3_even_raw, w2_even, w3_even, lane);
-        acc0 = q3_k_d32_dot8(w0_even, dsc01_even, 0, y0_even, y1_even, lane, acc0);
-        acc1 = q3_k_d32_dot8(w1_even, dsc01_even, 16, y0_even, y1_even, lane, acc1);
-        acc2 = q3_k_d32_dot8(w2_even, dsc23_even, 0, y0_even, y1_even, lane, acc2);
-        acc3 = q3_k_d32_dot8(w3_even, dsc23_even, 16, y0_even, y1_even, lane, acc3);
+        if constexpr (DIRECT) {
+            const float2 d01 = q3_k_d32_decode_d_pair_odd<false>(w0_even_raw, w1_even_raw);
+            const float2 d23 = q3_k_d32_decode_d_pair_odd<false>(w2_even_raw, w3_even_raw);
+            acc0 = q3_k_d32_dot8_direct(w0_even, d01.x, y0_even, y1_even, lane, acc0);
+            acc1 = q3_k_d32_dot8_direct(w1_even, d01.y, y0_even, y1_even, lane, acc1);
+            acc2 = q3_k_d32_dot8_direct(w2_even, d23.x, y0_even, y1_even, lane, acc2);
+            acc3 = q3_k_d32_dot8_direct(w3_even, d23.y, y0_even, y1_even, lane, acc3);
+        } else {
+            const float dsc01_even = q3_k_decode_dsc_pair_d32<false>(w0_even_raw, w1_even_raw, w0_even, w1_even, lane);
+            const float dsc23_even = q3_k_decode_dsc_pair_d32<false>(w2_even_raw, w3_even_raw, w2_even, w3_even, lane);
+            acc0 = q3_k_d32_dot8(w0_even, dsc01_even, 0, y0_even, y1_even, lane, acc0);
+            acc1 = q3_k_d32_dot8(w1_even, dsc01_even, 16, y0_even, y1_even, lane, acc1);
+            acc2 = q3_k_d32_dot8(w2_even, dsc23_even, 0, y0_even, y1_even, lane, acc2);
+            acc3 = q3_k_d32_dot8(w3_even, dsc23_even, 16, y0_even, y1_even, lane, acc3);
+        }
 
         const float4 y0_odd = y4[64];
         const float4 y1_odd = y4[72];
@@ -1157,12 +1203,21 @@ static __global__ void mul_mat_vec_q3_K_kepler_d32(
         const uint32_t w1_odd = q3_k_stitch_d32<true>(w1_odd_raw);
         const uint32_t w2_odd = q3_k_stitch_d32<true>(w2_odd_raw);
         const uint32_t w3_odd = q3_k_stitch_d32<true>(w3_odd_raw);
-        const float dsc01_odd = q3_k_decode_dsc_pair_d32<true>(w0_odd_raw, w1_odd_raw, w0_odd, w1_odd, lane);
-        const float dsc23_odd = q3_k_decode_dsc_pair_d32<true>(w2_odd_raw, w3_odd_raw, w2_odd, w3_odd, lane);
-        acc0 = q3_k_d32_dot8(w0_odd, dsc01_odd, 0, y0_odd, y1_odd, lane, acc0);
-        acc1 = q3_k_d32_dot8(w1_odd, dsc01_odd, 16, y0_odd, y1_odd, lane, acc1);
-        acc2 = q3_k_d32_dot8(w2_odd, dsc23_odd, 0, y0_odd, y1_odd, lane, acc2);
-        acc3 = q3_k_d32_dot8(w3_odd, dsc23_odd, 16, y0_odd, y1_odd, lane, acc3);
+        if constexpr (DIRECT) {
+            const float2 d01 = q3_k_d32_decode_d_pair_odd<true>(w0_odd_raw, w1_odd_raw);
+            const float2 d23 = q3_k_d32_decode_d_pair_odd<true>(w2_odd_raw, w3_odd_raw);
+            acc0 = q3_k_d32_dot8_direct(w0_odd, d01.x, y0_odd, y1_odd, lane, acc0);
+            acc1 = q3_k_d32_dot8_direct(w1_odd, d01.y, y0_odd, y1_odd, lane, acc1);
+            acc2 = q3_k_d32_dot8_direct(w2_odd, d23.x, y0_odd, y1_odd, lane, acc2);
+            acc3 = q3_k_d32_dot8_direct(w3_odd, d23.y, y0_odd, y1_odd, lane, acc3);
+        } else {
+            const float dsc01_odd = q3_k_decode_dsc_pair_d32<true>(w0_odd_raw, w1_odd_raw, w0_odd, w1_odd, lane);
+            const float dsc23_odd = q3_k_decode_dsc_pair_d32<true>(w2_odd_raw, w3_odd_raw, w2_odd, w3_odd, lane);
+            acc0 = q3_k_d32_dot8(w0_odd, dsc01_odd, 0, y0_odd, y1_odd, lane, acc0);
+            acc1 = q3_k_d32_dot8(w1_odd, dsc01_odd, 16, y0_odd, y1_odd, lane, acc1);
+            acc2 = q3_k_d32_dot8(w2_odd, dsc23_odd, 0, y0_odd, y1_odd, lane, acc2);
+            acc3 = q3_k_d32_dot8(w3_odd, dsc23_odd, 16, y0_odd, y1_odd, lane, acc3);
+        }
 
         x_ptr0 += 2 * sizeof(block_q3_K);
         x_ptr1 += 2 * sizeof(block_q3_K);
@@ -1177,6 +1232,7 @@ static __global__ void mul_mat_vec_q3_K_kepler_d32(
     }
 }
 
+template <bool DIRECT = false>
 __launch_bounds__(128)
 static __global__ void mul_mat_vec_q3_K_kepler_d32o(
         const block_q3_K * __restrict__ vx,
@@ -1237,12 +1293,21 @@ static __global__ void mul_mat_vec_q3_K_kepler_d32o(
         const uint32_t w1 = misaligned1 ? __byte_perm(raw1, __shfl_down_sync(0xffffffffu, raw1, 1), 0x5432u) : raw1;
         const uint32_t w2 = misaligned2 ? __byte_perm(raw2, __shfl_down_sync(0xffffffffu, raw2, 1), 0x5432u) : raw2;
         const uint32_t w3 = misaligned3 ? __byte_perm(raw3, __shfl_down_sync(0xffffffffu, raw3, 1), 0x5432u) : raw3;
-        const float dsc01 = q3_k_decode_dsc_pair_d32<true>(raw0, raw1, w0, w1, lane);
-        const float dsc23 = q3_k_decode_dsc_pair_d32<true>(raw2, raw3, w2, w3, lane);
-        acc0 = q3_k_d32_dot8(w0, dsc01, 0, y0, y1, lane, acc0);
-        acc1 = q3_k_d32_dot8(w1, dsc01, 16, y0, y1, lane, acc1);
-        acc2 = q3_k_d32_dot8(w2, dsc23, 0, y0, y1, lane, acc2);
-        acc3 = q3_k_d32_dot8(w3, dsc23, 16, y0, y1, lane, acc3);
+        if constexpr (DIRECT) {
+            const float2 d01 = q3_k_d32_decode_d_pair_odd<true>(raw0, raw1);
+            const float2 d23 = q3_k_d32_decode_d_pair_odd<true>(raw2, raw3);
+            acc0 = q3_k_d32_dot8_direct(w0, d01.x, y0, y1, lane, acc0);
+            acc1 = q3_k_d32_dot8_direct(w1, d01.y, y0, y1, lane, acc1);
+            acc2 = q3_k_d32_dot8_direct(w2, d23.x, y0, y1, lane, acc2);
+            acc3 = q3_k_d32_dot8_direct(w3, d23.y, y0, y1, lane, acc3);
+        } else {
+            const float dsc01 = q3_k_decode_dsc_pair_d32<true>(raw0, raw1, w0, w1, lane);
+            const float dsc23 = q3_k_decode_dsc_pair_d32<true>(raw2, raw3, w2, w3, lane);
+            acc0 = q3_k_d32_dot8(w0, dsc01, 0, y0, y1, lane, acc0);
+            acc1 = q3_k_d32_dot8(w1, dsc01, 16, y0, y1, lane, acc1);
+            acc2 = q3_k_d32_dot8(w2, dsc23, 0, y0, y1, lane, acc2);
+            acc3 = q3_k_d32_dot8(w3, dsc23, 16, y0, y1, lane, acc3);
+        }
         x_ptr0 += sizeof(block_q3_K);
         x_ptr1 += sizeof(block_q3_K);
         x_ptr2 += sizeof(block_q3_K);
@@ -1674,21 +1739,31 @@ static void launch_mmvk_q3_k_d32(
         const int nb, const int nrows, const int64_t stride_row_x,
         const uint3 channel_ratio, const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
         const uint3 sample_ratio, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
-        const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
-    mmvk_trace(GGML_TYPE_Q3_K, "d32", nrows, static_cast<int64_t>(nb) * QK_K);
+        const int64_t ne2, const int64_t ne3, cudaStream_t stream, const bool direct = false) {
+    mmvk_trace(GGML_TYPE_Q3_K, direct ? "d32s" : "d32", nrows, static_cast<int64_t>(nb) * QK_K);
     GGML_ASSERT((nb & 1) == 0 && "mul_mat_vec_q3_K_kepler_d32 needs an even number of blocks per row");
     constexpr int rows_per_block = 16;
     const unsigned int nblocks_x = static_cast<unsigned int>((static_cast<int64_t>(nrows) + rows_per_block - 1) / rows_per_block);
     const dim3 block_nums(nblocks_x, static_cast<unsigned int>(ne2), static_cast<unsigned int>(ne3));
     const dim3 block_dims(WARP_SIZE, 4, 1);
     const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
-    ggml_cuda_kernel_launch(
-        mul_mat_vec_q3_K_kepler_d32,
-        launch_params,
-        src0_d, src1_d, dst_d,
-        nb, nrows, stride_row_x,
-        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+    if (direct) {
+        ggml_cuda_kernel_launch(
+            mul_mat_vec_q3_K_kepler_d32<true>,
+            launch_params,
+            src0_d, src1_d, dst_d,
+            nb, nrows, stride_row_x,
+            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+    } else {
+        ggml_cuda_kernel_launch(
+            mul_mat_vec_q3_K_kepler_d32<false>,
+            launch_params,
+            src0_d, src1_d, dst_d,
+            nb, nrows, stride_row_x,
+            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+    }
 }
 
 static void launch_mmvk_q3_k_d32o(
@@ -1696,21 +1771,31 @@ static void launch_mmvk_q3_k_d32o(
         const int nb, const int nrows, const int64_t stride_row_x,
         const uint3 channel_ratio, const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
         const uint3 sample_ratio, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
-        const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
-    mmvk_trace(GGML_TYPE_Q3_K, "d32o", nrows, static_cast<int64_t>(nb) * QK_K);
+        const int64_t ne2, const int64_t ne3, cudaStream_t stream, const bool direct = false) {
+    mmvk_trace(GGML_TYPE_Q3_K, direct ? "d32os" : "d32o", nrows, static_cast<int64_t>(nb) * QK_K);
     GGML_ASSERT(nb >= 1 && "mul_mat_vec_q3_K_kepler_d32o needs at least one block per row");
     constexpr int rows_per_block = 16;
     const unsigned int nblocks_x = static_cast<unsigned int>((static_cast<int64_t>(nrows) + rows_per_block - 1) / rows_per_block);
     const dim3 block_nums(nblocks_x, static_cast<unsigned int>(ne2), static_cast<unsigned int>(ne3));
     const dim3 block_dims(WARP_SIZE, 4, 1);
     const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
-    ggml_cuda_kernel_launch(
-        mul_mat_vec_q3_K_kepler_d32o,
-        launch_params,
-        src0_d, src1_d, dst_d,
-        nb, nrows, stride_row_x,
-        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+    if (direct) {
+        ggml_cuda_kernel_launch(
+            mul_mat_vec_q3_K_kepler_d32o<true>,
+            launch_params,
+            src0_d, src1_d, dst_d,
+            nb, nrows, stride_row_x,
+            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+    } else {
+        ggml_cuda_kernel_launch(
+            mul_mat_vec_q3_K_kepler_d32o<false>,
+            launch_params,
+            src0_d, src1_d, dst_d,
+            nb, nrows, stride_row_x,
+            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+    }
 }
 
 struct mmvk_texture_entry {
@@ -3241,6 +3326,28 @@ bool ggml_cuda_mul_mat_vec_kepler(
             && (src0->ne[2] == 1 || (stride_channel_x & 1) == 0)
             && (src0->ne[3] == 1 || (stride_sample_x & 1) == 0);
         const bool q3_d32o_ok = nb >= 1 && ((reinterpret_cast<uintptr_t>(src0_d) & 3u) == 0u);
+        if (variant != nullptr && std::strcmp(variant, "d32s") == 0) {
+            if (q3_even_pairs_ok) {
+                launch_mmvk_q3_k_d32(
+                    src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+                    channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
+                    dst->ne[2], dst->ne[3], stream, true);
+            } else if (q3_d32o_ok) {
+                launch_mmvk_q3_k_d32o(
+                    src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+                    channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
+                    dst->ne[2], dst->ne[3], stream);
+            } else {
+                launch_mmvk_q3_k_pl2(
+                    src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+                    channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
+                    dst->ne[2], dst->ne[3], stream);
+            }
+            return true;
+        }
         if (variant != nullptr && std::strcmp(variant, "d32o") == 0) {
             if (q3_d32o_ok) {
                 launch_mmvk_q3_k_d32o(
@@ -3282,7 +3389,7 @@ bool ggml_cuda_mul_mat_vec_kepler(
                 src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
-                dst->ne[2], dst->ne[3], stream);
+                dst->ne[2], dst->ne[3], stream, true);
         } else if (q3_auto && q3_d32o_ok) {
             launch_mmvk_q3_k_d32o(
                 src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
