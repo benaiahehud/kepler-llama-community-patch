@@ -1509,7 +1509,8 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const bool pp_pad_selected = strcmp(pp_mode, "pad") == 0 || strcmp(pp_mode, "auto") == 0;
     const bool pp_active = pp_chunk_selected && compute_type == GGML_TYPE_F32 &&
         GGML_CUDA_CC_IS_NVIDIA(cc) && cc < 500 && ne12 == 1 && ne13 == 1 &&
-        src0->type != compute_type && ggml_is_quantized(src0->type) && ggml_is_contiguous(src0);
+        src0->type != compute_type && ggml_is_quantized(src0->type) && ggml_is_contiguous(src0) &&
+        (ne11 < 96 || strcmp(pp_mode, "auto") != 0); // r28b: auto leaves n >= 96 on the stock path (chunking cost ~2% at ub 128)
 
     const size_t src0_ts = ggml_type_size(src0->type);
     GGML_ASSERT(nb00 == src0_ts);
