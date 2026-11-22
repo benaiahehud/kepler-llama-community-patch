@@ -1488,6 +1488,28 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const int64_t ne_dst = ggml_nelements(dst);
     cudaStream_t main_stream = ctx.stream();
     cublasHandle_t cublas_h = ctx.cublas_handle();
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+
+    static const char * pp_mode = []() {
+        const char * env = std::getenv("GGML_CUDA_KEPLER_PP");
+        return env != nullptr ? env : "auto";
+    }();
+    static const int64_t pp_rows_setting = []() {
+        const char * env = std::getenv("GGML_CUDA_KEPLER_PP_ROWS");
+        const int64_t value = env != nullptr ? std::atoi(env) : 512;
+        return value > 0 ? value : 512;
+    }();
+    static const int64_t pp_npad_setting = []() {
+        const char * env = std::getenv("GGML_CUDA_KEPLER_PP_NPAD");
+        const int64_t value = env != nullptr ? std::atoi(env) : 96;
+        return value > 0 ? value : 96;
+    }();
+    const bool pp_chunk_selected = strcmp(pp_mode, "chunk") == 0 ||
+        strcmp(pp_mode, "pad") == 0 || strcmp(pp_mode, "auto") == 0;
+    const bool pp_pad_selected = strcmp(pp_mode, "pad") == 0 || strcmp(pp_mode, "auto") == 0;
+    const bool pp_active = pp_chunk_selected && compute_type == GGML_TYPE_F32 &&
+        GGML_CUDA_CC_IS_NVIDIA(cc) && cc < 500 && ne12 == 1 && ne13 == 1 &&
+        src0->type != compute_type && ggml_is_quantized(src0->type) && ggml_is_contiguous(src0);
 
     const size_t src0_ts = ggml_type_size(src0->type);
     GGML_ASSERT(nb00 == src0_ts);
@@ -1514,6 +1536,11 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 
     if (src0->type == compute_type) {
         src0_ptr = (const cuda_t *) src0->data;
+    } else if (pp_active) {
+        s01 = ne00;
+        s02 = ne01*s01;
+        s03 = ne02*s02;
+        is_src0_cont_2 = true;
     } else {
         src0_alloc.alloc(ggml_nelements(src0));
 
@@ -1594,7 +1621,6 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const void * alpha = traits::get_alpha();
     const void * beta = traits::get_beta();
 
-    const int cc = ggml_cuda_info().devices[ctx.device].cc;
     // Kepler port: upstream rules, plus f32 output on GPUs without fast fp16 arithmetic (sm_30).
     // (The community patch had `cc == !fast_fp16_hardware_available(cc)`, always false, and narrowed BF16.)
     bool prefer_f32_output = false;
@@ -1622,6 +1648,44 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 
     GGML_ASSERT(ne12 % ne02 == 0);
     GGML_ASSERT(ne13 % ne03 == 0);
+
+    if (pp_active) {
+        if constexpr (compute_type == GGML_TYPE_F32) {
+            const auto convert_func = traits::convert(src0->type);
+            GGML_ASSERT(convert_func != nullptr);
+            const int64_t rows_per_chunk = std::min(pp_rows_setting, ne01);
+            const bool pp_pad = pp_pad_selected && ne11 > 8 && ne11 < 96 && pp_npad_setting >= ne11;
+            const int64_t gemm_columns = pp_pad ? pp_npad_setting : ne11;
+            const int64_t padded_columns = pp_pad ? pp_npad_setting : 0;
+            ggml_cuda_pool_alloc<float> src0_chunk(ctx.pool());
+            src0_chunk.alloc(rows_per_chunk*ne00);
+            ggml_cuda_pool_alloc<float> src1_padded(ctx.pool());
+            ggml_cuda_pool_alloc<float> dst_padded(ctx.pool());
+            if (pp_pad) {
+                src1_padded.alloc(ne10*padded_columns);
+                dst_padded.alloc(rows_per_chunk*padded_columns);
+                CUDA_CHECK(cudaMemsetAsync(src1_padded.get(), 0, ne10*padded_columns*sizeof(float), main_stream));
+                CUDA_CHECK(cudaMemcpy2DAsync(src1_padded.get(), ne10*sizeof(float), src1_ptr, s11*sizeof(float),
+                        ne10*sizeof(float), ne11, cudaMemcpyDeviceToDevice, main_stream));
+            }
+            for (int64_t m0 = 0; m0 < ne01; m0 += rows_per_chunk) {
+                const int64_t rows = std::min(rows_per_chunk, ne01 - m0);
+                convert_func((const char *) src0->data + m0*nb01, src0_chunk.get(), rows*ne00, main_stream);
+                float * dst_chunk = pp_pad ? dst_padded.get() : (float *) dst_ptr + m0;
+                CUBLAS_CHECK(cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                        rows, gemm_columns, ne10,
+                        (const float *) alpha, src0_chunk.get(), ne00,
+                        pp_pad ? src1_padded.get() : (const float *) src1_ptr, pp_pad ? ne10 : s11,
+                        (const float *) beta, dst_chunk, pp_pad ? rows : ldc));
+                if (pp_pad) {
+                    CUDA_CHECK(cudaMemcpy2DAsync((char *) dst_ptr + m0*sizeof(float), ldc*sizeof(float),
+                            dst_padded.get(), rows*sizeof(float), rows*sizeof(float), ne11,
+                            cudaMemcpyDeviceToDevice, main_stream));
+                }
+            }
+            return;
+        }
+    }
 
     // broadcast factors
     const int64_t r2 = ne12/ne02;
