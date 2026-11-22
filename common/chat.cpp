@@ -1383,6 +1383,12 @@ static common_chat_params_init_fn common_chat_template_detect_params_init(const 
         return common_chat_params_init_deepseek_v3_2;
     }
 
+    // FunctionGemma: Gemma 3 turns with <start_function_call>call:NAME{...}<end_function_call> tool calls
+    if (src.find("'<start_function_call>call:'") != std::string::npos) {
+        LOG_DBG("Using specialized template: FunctionGemma\n");
+        return common_chat_params_init_functiongemma;
+    }
+
     // Gemma4 format detection
     if (src.find("'<|tool_call>call:'") != std::string::npos) {
         LOG_DBG("Using specialized template: Gemma4\n");
