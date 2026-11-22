@@ -11,6 +11,9 @@
 #include <set>
 #include <string>
 
+// MMVK_NCOLS_TYPES: q3_K
+
+
 static_assert(sizeof(block_q4_K) == 144, "unexpected block_q4_K size");
 static_assert(offsetof(block_q4_K, scales) == 4, "unexpected block_q4_K scales offset");
 static_assert(offsetof(block_q4_K, qs) == 16, "unexpected block_q4_K qs offset");
@@ -61,6 +64,8 @@ static void mmvk_trace_stock(const ggml_type type, const char * reason, const in
 
 // Selectable Kepler (sm_30) launch geometries:
 // - GGML_CUDA_KEPLER_MMV_Q3K: "auto" (d32 on even block pairs, d32o otherwise when aligned), "d32", "d32o", "pl2", "pl", "off" (stock)
+//   ne11 = 2..8 (r21, speculative-decoding verify): d32c<2> per pair of columns, d32o for an odd last column,
+//   whatever the variant except "off"
 // - GGML_CUDA_KEPLER_MMV_Q4K: "auto", "vk2", "sy"
 // - GGML_CUDA_KEPLER_MMV_Q6K: "auto", "d32"
 // - GGML_CUDA_KEPLER_MMV_Q8: "auto", "ws", "ws2"
@@ -1249,6 +1254,73 @@ static __global__ void mul_mat_vec_q3_K_kepler_d32o(
     }
 }
 
+template <int NCOLS>
+__launch_bounds__(128)
+static __global__ void mul_mat_vec_q3_K_kepler_d32c(
+        const block_q3_K * __restrict__ vx,
+        const float * __restrict__ vy,
+        float * __restrict__ dst,
+        const int nb,
+        const int nrows,
+        const int64_t stride_row_x,
+        const int64_t stride_column_y,
+        const int64_t stride_column_dst,
+        const uint3 channel_ratio,
+        const int64_t stride_channel_x,
+        const int64_t stride_channel_y,
+        const int64_t stride_channel_dst,
+        const uint3 sample_ratio,
+        const int64_t stride_sample_x,
+        const int64_t stride_sample_y,
+        const int64_t stride_sample_dst) {
+    constexpr int ROWS_PER_WARP = 2;
+    constexpr int ROWS_PER_BLOCK = 4 * ROWS_PER_WARP;
+    const int first_row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y * ROWS_PER_WARP;
+    if (first_row >= nrows) {
+        return;
+    }
+    const uint32_t channel_x = fastdiv(blockIdx.y, channel_ratio);
+    const uint32_t sample_x = fastdiv(blockIdx.z, sample_ratio);
+    const block_q3_K * x_base = vx + sample_x * stride_sample_x + channel_x * stride_channel_x;
+    const float * y_base = vy + blockIdx.z * stride_sample_y + blockIdx.y * stride_channel_y;
+    const uint8_t * x_ptr0 = reinterpret_cast<const uint8_t *>(x_base + static_cast<int64_t>(min(first_row, nrows - 1)) * stride_row_x);
+    const uint8_t * x_ptr1 = reinterpret_cast<const uint8_t *>(x_base + static_cast<int64_t>(min(first_row + 1, nrows - 1)) * stride_row_x);
+    const int lane = threadIdx.x;
+    float acc0[NCOLS] = {};
+    float acc1[NCOLS] = {};
+#pragma unroll 1
+    for (int ib = 0; ib < nb; ++ib) {
+        const bool misaligned0 = (reinterpret_cast<uintptr_t>(x_ptr0) & 2u) != 0;
+        const bool misaligned1 = (reinterpret_cast<uintptr_t>(x_ptr1) & 2u) != 0;
+        const uint32_t * p0 = reinterpret_cast<const uint32_t *>(x_ptr0 - (misaligned0 ? 2 : 0));
+        const uint32_t * p1 = reinterpret_cast<const uint32_t *>(x_ptr1 - (misaligned1 ? 2 : 0));
+        uint32_t raw0 = lane < (misaligned0 ? 28 : 27) ? p0[lane] : 0u;
+        uint32_t raw1 = lane < (misaligned1 ? 28 : 27) ? p1[lane] : 0u;
+        if (lane == 27 && !misaligned0) raw0 = static_cast<uint32_t>(*reinterpret_cast<const uint16_t *>(x_ptr0 + 108)) << 16;
+        if (lane == 27 && !misaligned1) raw1 = static_cast<uint32_t>(*reinterpret_cast<const uint16_t *>(x_ptr1 + 108)) << 16;
+        const uint32_t w0 = misaligned0 ? __byte_perm(raw0, __shfl_down_sync(0xffffffffu, raw0, 1), 0x5432u) : raw0;
+        const uint32_t w1 = misaligned1 ? __byte_perm(raw1, __shfl_down_sync(0xffffffffu, raw1, 1), 0x5432u) : raw1;
+        const float dsc01 = q3_k_decode_dsc_pair_d32<true>(raw0, raw1, w0, w1, lane);
+#pragma unroll
+        for (int col = 0; col < NCOLS; ++col) {
+            const float4 * y4 = reinterpret_cast<const float4 *>(y_base + col * stride_column_y
+                + QK_K * ib + 32 * (2 * (lane >> 3)) + 4 * (lane & 7));
+            acc0[col] = q3_k_d32_dot8(w0, dsc01, 0, y4[0], y4[8], lane, acc0[col]);
+            acc1[col] = q3_k_d32_dot8(w1, dsc01, 16, y4[0], y4[8], lane, acc1[col]);
+        }
+        x_ptr0 += sizeof(block_q3_K);
+        x_ptr1 += sizeof(block_q3_K);
+    }
+#pragma unroll
+    for (int col = 0; col < NCOLS; ++col) {
+        const float sums = warp_reduce_sum_4rows_packed(acc0[col], acc1[col], 0.0f, 0.0f, lane);
+        if (lane < ROWS_PER_WARP && first_row + lane < nrows) {
+            float * dst_base = dst + blockIdx.z * stride_sample_dst + blockIdx.y * stride_channel_dst;
+            dst_base[first_row + lane + col * stride_column_dst] = sums;
+        }
+    }
+}
+
 __launch_bounds__(128)
 static __global__ void mul_mat_vec_q3_K_kepler_pl(
         const block_q3_K * __restrict__ vx,
@@ -1531,6 +1603,30 @@ static void launch_mmvk_q3_k_d32o(
         launch_params,
         src0_d, src1_d, dst_d,
         nb, nrows, stride_row_x,
+        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+}
+
+template <int NCOLS>
+static void launch_mmvk_q3_k_d32c(
+        const block_q3_K * src0_d, const float * src1_d, float * dst_d,
+        const int nb, const int nrows, const int64_t stride_row_x,
+        const int64_t stride_column_y, const int64_t stride_column_dst,
+        const uint3 channel_ratio, const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
+        const uint3 sample_ratio, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
+        const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    const char * kernel = "d32c2";
+    mmvk_trace(GGML_TYPE_Q3_K, kernel, nrows, static_cast<int64_t>(nb) * QK_K);
+    constexpr int rows_per_block = 8;
+    const unsigned int nblocks_x = static_cast<unsigned int>((static_cast<int64_t>(nrows) + rows_per_block - 1) / rows_per_block);
+    const dim3 block_nums(nblocks_x, static_cast<unsigned int>(ne2), static_cast<unsigned int>(ne3));
+    const dim3 block_dims(WARP_SIZE, 4, 1);
+    const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
+    ggml_cuda_kernel_launch(
+        mul_mat_vec_q3_K_kepler_d32c<NCOLS>,
+        launch_params,
+        src0_d, src1_d, dst_d,
+        nb, nrows, stride_row_x, stride_column_y, stride_column_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
 }
@@ -2742,7 +2838,11 @@ static bool ggml_cuda_mmvk_shape_supported(const ggml_tensor * src0, const ggml_
     const int64_t ne2  = dst->ne[2];
     const int64_t ne3  = dst->ne[3];
 
-    if (ne11 != 1 || ne1 != 1 || ne10 != ne00 || ne0 != ne01 || ne2 != ne12 || ne3 != ne13) {
+    const bool q3_multi_column = src0->type == GGML_TYPE_Q3_K && ne11 >= 1 && ne11 <= 8 && ne1 == ne11;
+    if ((!q3_multi_column && (ne11 != 1 || ne1 != 1)) || ne10 != ne00 || ne0 != ne01 || ne2 != ne12 || ne3 != ne13) {
+        return false;
+    }
+    if (q3_multi_column && ne11 > 1 && (src1->nb[1] % 16) != 0) {
         return false;
     }
     const int64_t block_size = ggml_blck_size(src0->type);
@@ -2850,9 +2950,11 @@ bool ggml_cuda_mul_mat_vec_kepler(
     const int64_t stride_sample_x    = static_cast<int64_t>(src0->nb[3] / ts_src0);
 
     const int64_t stride_channel_y   = static_cast<int64_t>(src1->nb[2] / ts_f32);
+    const int64_t stride_column_y    = static_cast<int64_t>(src1->nb[1] / ts_f32);
     const int64_t stride_sample_y    = static_cast<int64_t>(src1->nb[3] / ts_f32);
 
     const int64_t stride_channel_dst = static_cast<int64_t>(dst->nb[2] / ts_f32);
+    const int64_t stride_column_dst  = static_cast<int64_t>(dst->nb[1] / ts_f32);
     const int64_t stride_sample_dst  = static_cast<int64_t>(dst->nb[3] / ts_f32);
 
     const uint3 channel_ratio = init_fastdiv_values(static_cast<uint64_t>(dst->ne[2] / src0->ne[2]));
@@ -2879,6 +2981,27 @@ bool ggml_cuda_mul_mat_vec_kepler(
         const char * variant = ggml_cuda_kepler_mmv_q3k_variant();
         if (variant != nullptr && std::strcmp(variant, "off") == 0) {
             return false;
+        }
+        if (src1->ne[1] > 1) {
+            // d32c<2> and d32o pick the load path per (row, block) from the address, so a 2-byte-offset view
+            // (mmvk-check off=1) is fine here; base addresses are always even (block_q3_K is 110 bytes)
+            for (int64_t col = 0; col < src1->ne[1];) {
+                const int remaining = static_cast<int>(src1->ne[1] - col);
+                const float * y_col = src1_d + col * stride_column_y;
+                float * dst_col = dst_d + col * stride_column_dst;
+                if (remaining >= 2) {
+                    launch_mmvk_q3_k_d32c<2>(src0_d, y_col, dst_col, nb, nrows, stride_row_x,
+                        stride_column_y, stride_column_dst, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, dst->ne[2], dst->ne[3], stream);
+                    col += 2;
+                } else {
+                    launch_mmvk_q3_k_d32o(src0_d, y_col, dst_col, nb, nrows, stride_row_x,
+                        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, dst->ne[2], dst->ne[3], stream);
+                    ++col;
+                }
+            }
+            return true;
         }
         const bool q3_even_pairs_ok = ((nb & 1) == 0)
             && ((stride_row_x & 1) == 0)
