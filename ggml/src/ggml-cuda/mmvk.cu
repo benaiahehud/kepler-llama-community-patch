@@ -64,7 +64,7 @@ static void mmvk_trace_stock(const ggml_type type, const char * reason, const in
 // - GGML_CUDA_KEPLER_MMV_Q4K: "auto", "vk2", "sy"
 // - GGML_CUDA_KEPLER_MMV_Q6K: "auto", "d32"
 // - GGML_CUDA_KEPLER_MMV_Q8: "auto", "ws", "ws2"
-// - GGML_CUDA_KEPLER_MMV_IQ3: "auto" (default), "sb", "off"
+// - GGML_CUDA_KEPLER_MMV_IQ3: "auto" (default/g32), "g32", "sb", "off" (stock)
 enum mmvk_q4_k_variant {
     MMVK_Q4_K_AUTO = 0,
     MMVK_Q4_K_VK2,
@@ -82,12 +82,14 @@ enum mmvk_q8_0_variant {
     MMVK_Q8_0_WS2,
 };
 
-static bool ggml_cuda_kepler_mmv_iq3_sb_enabled() {
-    static const bool enabled = []() {
-        const char * env = std::getenv("GGML_CUDA_KEPLER_MMV_IQ3");
-        return env == nullptr || std::strcmp(env, "off") != 0;   // r15: on by default ("auto"/"sb"); "off" = stock
-    }();
-    return enabled;
+static const char * ggml_cuda_kepler_mmv_iq3_variant() {
+    static const char * variant = std::getenv("GGML_CUDA_KEPLER_MMV_IQ3");
+    return variant;
+}
+
+static bool ggml_cuda_kepler_mmv_iq3_enabled() {
+    const char * variant = ggml_cuda_kepler_mmv_iq3_variant();
+    return variant == nullptr || std::strcmp(variant, "off") != 0;
 }
 
 static const char * ggml_cuda_kepler_mmv_q3k_variant() {
@@ -2395,9 +2397,41 @@ static __device__ __forceinline__ float iq3_xxs_sb_dot8(
     return dot * db;
 }
 
-template <int RPW>   // rows per warp
+static __device__ __forceinline__ float iq3_xxs_g32_dot8(
+        const char * block, const int ib32, const int l, const uint32_t * grid_u32, const float4 y1, const float4 y2) {
+    const uint16_t * halfwords = reinterpret_cast<const uint16_t *>(block);
+    const uint16_t q = halfwords[1 + 4 * ib32 + l];
+    const uint32_t aux = static_cast<uint32_t>(halfwords[33 + 2 * ib32])
+        | (static_cast<uint32_t>(halfwords[34 + 2 * ib32]) << 16);
+    half d_h;
+    memcpy(&d_h, halfwords, sizeof(d_h));
+    const float db = __half2float(d_h) * (0.5f + static_cast<float>(aux >> 28)) * 0.5f;
+    const uint32_t s7 = (aux >> (7 * l)) & 127u;
+    const uint32_t signs = s7 | ((__popc(s7) & 1u) << 7);
+    const uint32_t g1u = grid_u32[q & 0xffu];
+    const uint32_t g2u = grid_u32[q >> 8];
+#define IQ3_G32_FLOAT(u) (__uint_as_float(0x4b000000u | ((u) & 0xffu)) - 8388608.0f)
+    const float4 g1 = make_float4(IQ3_G32_FLOAT(g1u), IQ3_G32_FLOAT(g1u >> 8), IQ3_G32_FLOAT(g1u >> 16), IQ3_G32_FLOAT(g1u >> 24));
+    const float4 g2 = make_float4(IQ3_G32_FLOAT(g2u), IQ3_G32_FLOAT(g2u >> 8), IQ3_G32_FLOAT(g2u >> 16), IQ3_G32_FLOAT(g2u >> 24));
+#undef IQ3_G32_FLOAT
+    uint32_t s = signs << 24;
+    float dot = 0.0f;
+#define IQ3_SIGNED(g) __uint_as_float(__float_as_uint(g) ^ (s & 0x80000000u))
+    dot = fmaf(IQ3_SIGNED(g2.w), y2.w, dot); s += s;
+    dot = fmaf(IQ3_SIGNED(g2.z), y2.z, dot); s += s;
+    dot = fmaf(IQ3_SIGNED(g2.y), y2.y, dot); s += s;
+    dot = fmaf(IQ3_SIGNED(g2.x), y2.x, dot); s += s;
+    dot = fmaf(IQ3_SIGNED(g1.w), y1.w, dot); s += s;
+    dot = fmaf(IQ3_SIGNED(g1.z), y1.z, dot); s += s;
+    dot = fmaf(IQ3_SIGNED(g1.y), y1.y, dot); s += s;
+    dot = fmaf(IQ3_SIGNED(g1.x), y1.x, dot);
+#undef IQ3_SIGNED
+    return dot * db;
+}
+
+template <int RPW, bool G32 = false>   // rows per warp; G32 = grid as uint32 + float-magic decode (r19)
 __launch_bounds__(128)
-static __global__ void mul_mat_vec_iq3_xxs_kepler_sb(
+static __global__ void mul_mat_vec_iq3_xxs_kepler(
         const char * __restrict__ vx,
         const float * __restrict__ vy,
         float * __restrict__ dst,
@@ -2415,14 +2449,20 @@ static __global__ void mul_mat_vec_iq3_xxs_kepler_sb(
     // grid table in shared memory. Staged with explicit indices: a `for (i = tid; i < 256; i += 128)` loop is
     // miscompiled by this toolchain (clang-22 + ptxas 10.2, sm_30: the remainder trip count comes out as
     // `ISUB R, R4, R4` = 0, so entries 128..255 were never written; probe: iq3-table-probe.cu, 2026-11-21).
-    // r16 (Neon review): the table is pre-expanded to float4 (4 KB) so the inner loop does no byte decode.
+    // r16 (Neon review): the `sb` table is pre-expanded to float4 so the inner loop does no byte decode.
     __shared__ float4 grid_f4[256];
+    __shared__ uint32_t grid_u32[256];
     {
         const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;   // blockDim = (32, 4): launcher asserts it
-        const uint32_t g0 = iq3xxs_grid[tid];
-        const uint32_t g1 = iq3xxs_grid[tid + 128];
-        grid_f4[tid]       = make_float4((float) (g0 & 0xffu), (float) ((g0 >> 8) & 0xffu), (float) ((g0 >> 16) & 0xffu), (float) (g0 >> 24));
-        grid_f4[tid + 128] = make_float4((float) (g1 & 0xffu), (float) ((g1 >> 8) & 0xffu), (float) ((g1 >> 16) & 0xffu), (float) (g1 >> 24));
+        if constexpr (G32) {
+            grid_u32[tid] = iq3xxs_grid[tid];
+            grid_u32[tid + 128] = iq3xxs_grid[tid + 128];
+        } else {
+            const uint32_t g0 = iq3xxs_grid[tid];
+            const uint32_t g1 = iq3xxs_grid[tid + 128];
+            grid_f4[tid]       = make_float4((float) (g0 & 0xffu), (float) ((g0 >> 8) & 0xffu), (float) ((g0 >> 16) & 0xffu), (float) (g0 >> 24));
+            grid_f4[tid + 128] = make_float4((float) (g1 & 0xffu), (float) ((g1 >> 8) & 0xffu), (float) ((g1 >> 16) & 0xffu), (float) (g1 >> 24));
+        }
     }
     __syncthreads();
 
@@ -2455,7 +2495,11 @@ static __global__ void mul_mat_vec_iq3_xxs_kepler_sb(
             const float4 y2 = *reinterpret_cast<const float4 *>(y_base + y_index + 4);
 #pragma unroll
             for (int r = 0; r < RPW; ++r) {
-                acc[r] += iq3_xxs_sb_dot8(row_x[r] + b * sizeof(block_iq3_xxs), ib32, l, grid_f4, y1, y2);
+                if constexpr (G32) {
+                    acc[r] += iq3_xxs_g32_dot8(row_x[r] + b * sizeof(block_iq3_xxs), ib32, l, grid_u32, y1, y2);
+                } else {
+                    acc[r] += iq3_xxs_sb_dot8(row_x[r] + b * sizeof(block_iq3_xxs), ib32, l, grid_f4, y1, y2);
+                }
             }
         }
     }
@@ -2486,6 +2530,7 @@ static void launch_mmvk_iq3_xxs_sb(
         const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
     constexpr int WARPS_PER_BLOCK = 4;   // the kernel's grid staging assumes exactly 128 threads (32 x 4)
     static_assert(WARPS_PER_BLOCK * WARP_SIZE == 128, "iq3_xxs sb stages its table with 128 threads");
+    const char * variant = ggml_cuda_kepler_mmv_iq3_variant();   // cached (r18)
     // rows per warp: GGML_CUDA_KEPLER_MMV_IQ3_RPW = 1, 2 or 4 forces it; default 4, but 1 for short matrices
     // (r16: 16x2048 takes 25 us at 1 row per warp vs 45 us at 4, which leaves the card one thread block)
     static const int rpw_env = []() {
@@ -2499,11 +2544,41 @@ static void launch_mmvk_iq3_xxs_sb(
         static_cast<unsigned int>(ne2), static_cast<unsigned int>(ne3));
     const dim3 block_dims(WARP_SIZE, WARPS_PER_BLOCK, 1);
     const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
-    auto kernel = rpw == 1 ? mul_mat_vec_iq3_xxs_kepler_sb<1> : rpw == 2 ? mul_mat_vec_iq3_xxs_kepler_sb<2> : mul_mat_vec_iq3_xxs_kepler_sb<4>;
-    ggml_cuda_kernel_launch(kernel, launch_params,
-        src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
-        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+    const bool g32 = variant == nullptr || variant[0] == '\0' || std::strcmp(variant, "auto") == 0
+        || std::strcmp(variant, "g32") == 0;
+    if (g32) {
+        if (rpw == 1) {
+            ggml_cuda_kernel_launch(mul_mat_vec_iq3_xxs_kepler<1, true>, launch_params,
+                src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+        } else if (rpw == 2) {
+            ggml_cuda_kernel_launch(mul_mat_vec_iq3_xxs_kepler<2, true>, launch_params,
+                src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+        } else {
+            ggml_cuda_kernel_launch(mul_mat_vec_iq3_xxs_kepler<4, true>, launch_params,
+                src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+        }
+    } else if (rpw == 1) {
+        ggml_cuda_kernel_launch(mul_mat_vec_iq3_xxs_kepler<1>, launch_params,
+            src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+    } else if (rpw == 2) {
+        ggml_cuda_kernel_launch(mul_mat_vec_iq3_xxs_kepler<2>, launch_params,
+            src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+    } else {
+        ggml_cuda_kernel_launch(mul_mat_vec_iq3_xxs_kepler<4>, launch_params,
+            src0_d, src1_d, dst_d, nb, nrows, stride_row_x,
+            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+    }
 }
 
 template <typename T>
@@ -2645,7 +2720,7 @@ static bool ggml_cuda_mmvk_shape_supported(const ggml_tensor * src0, const ggml_
         return false;
     }
     if (src0->type != GGML_TYPE_Q3_K && src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_Q8_0 &&
-            src0->type != GGML_TYPE_Q5_0 && !(src0->type == GGML_TYPE_IQ3_XXS && ggml_cuda_kepler_mmv_iq3_sb_enabled())) {
+            src0->type != GGML_TYPE_Q5_0 && !(src0->type == GGML_TYPE_IQ3_XXS && ggml_cuda_kepler_mmv_iq3_enabled())) {
         return false;
     }
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
@@ -2724,7 +2799,7 @@ bool ggml_cuda_should_use_mmvk(const ggml_tensor * src0, const ggml_tensor * src
     if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_KEPLER || cc >= 500) {
         return false;
     }
-    if (src0 != nullptr && src0->type == GGML_TYPE_IQ3_XXS && !ggml_cuda_kepler_mmv_iq3_sb_enabled()) {
+    if (src0 != nullptr && src0->type == GGML_TYPE_IQ3_XXS && !ggml_cuda_kepler_mmv_iq3_enabled()) {
         mmvk_trace_stock(src0->type, "off", src0->ne[1], src0->ne[0]);
         return false;
     }
@@ -2788,7 +2863,9 @@ bool ggml_cuda_mul_mat_vec_kepler(
     cudaStream_t  stream = ctx.stream();
 
     if (src0->type == GGML_TYPE_IQ3_XXS) {
-        mmvk_trace(src0->type, "sb", nrows, src0->ne[0]);
+        const char * variant = ggml_cuda_kepler_mmv_iq3_variant();
+        const char * kernel = (variant == nullptr || variant[0] == '\0' || std::strcmp(variant, "auto") == 0 || std::strcmp(variant, "g32") == 0) ? "g32" : "sb";
+        mmvk_trace(src0->type, kernel, nrows, src0->ne[0]);
         launch_mmvk_iq3_xxs_sb(
             static_cast<const char *>(src0->data), src1_d, dst_d, nb, nrows, stride_row_x,
             channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
