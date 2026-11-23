@@ -18,3 +18,5 @@ Everything in this repository is MIT licensed (see LICENSE):
 
 The Kepler kernels are also available, without the #29961-derived code, as a separate clean-room patch series
 (kepler-llama).
+
+Security notes for this build (old llama.cpp base, end-of-life CUDA and driver): see KEPLER-SECURITY.md.
