@@ -14,9 +14,9 @@ Everything in this repository is MIT licensed (see LICENSE):
 
 - llama.cpp and ggml: Copyright (c) 2023-2026 The ggml authors.
 - The Kepler / old-GPU CUDA port from discussion #29961: Copyright (c) 2026 6uO, MIT.
-- The Kepler kernels, tooling and changes made for this project: Copyright (c) 2026 The kepler-llama authors, MIT.
+- The Kepler kernels, tooling and changes made for this project: Copyright (c) 2026 The oldcard-lab authors, MIT.
 
 The Kepler kernels are also available, without the #29961-derived code, as a separate clean-room patch series
-(kepler-llama).
+with build and test scripts: [oldcard-lab/llama-cuda102](https://github.com/oldcard-lab/llama-cuda102).
 
 Security notes for this build (old llama.cpp base, end-of-life CUDA and driver): see KEPLER-SECURITY.md.

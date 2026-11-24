@@ -4,6 +4,10 @@
 > for Kepler GPUs of compute capability 3.0 (GeForce GTX 600 / 700 series such as the GTX 650 Ti, 660, 670, 680)
 > and custom Kepler kernels. For current llama.cpp, go to [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).
 > The upstream README follows below this section and still applies to everything that is not Kepler-specific.
+>
+> **Most people should use [oldcard-lab/llama-cuda102](https://github.com/oldcard-lab/llama-cuda102) instead:** the
+> same Kepler kernels as a small patch series with install, build and test scripts and a strict kernel checker. This
+> repository is the original development line, built on 6uO's patch.
 
 Current CUDA releases dropped Kepler. This line builds llama.cpp's CUDA backend with CUDA 10.2, the last toolkit
 that supports sm_30, using clang as the CUDA compiler, and adds:
