@@ -6,8 +6,9 @@
 > The upstream README follows below this section and still applies to everything that is not Kepler-specific.
 >
 > **Most people should use [oldcard-lab/llama-cuda102](https://github.com/oldcard-lab/llama-cuda102) instead:** the
-> same Kepler kernels as a small patch series with install, build and test scripts and a strict kernel checker. This
-> repository is the original development line, built on 6uO's patch.
+> same patches (6uO's port plus the Kepler kernels), moved to llama.cpp v1.0.0, as a small patch series with install,
+> build and test scripts and a strict kernel checker. This repository is the original development line on v0.8.0:
+> the same patches applied to a full llama.cpp tree.
 
 Current CUDA releases dropped Kepler. This line builds llama.cpp's CUDA backend with CUDA 10.2, the last toolkit
 that supports sm_30, using clang as the CUDA compiler, and adds:
@@ -19,8 +20,9 @@ that supports sm_30, using clang as the CUDA compiler, and adds:
 - **A Kepler im2col** for convolution models.
 - **A FunctionGemma tool-call parser** for `llama-server --jinja`.
 
-Every change is guarded by GPU architecture, and each Kepler path can be turned off: `GGML_CUDA_KEPLER_MMV=0`,
-`GGML_CUDA_KEPLER_PP=off`, `GGML_CUDA_KEPLER_IM2COL=off`. `GGML_CUDA_KEPLER_TRACE=1` prints which kernel ran.
+The Kepler kernels only run below compute capability 5.0, and each Kepler path can be turned off:
+`GGML_CUDA_KEPLER_MMV=0`, `GGML_CUDA_KEPLER_PP=off`, `GGML_CUDA_KEPLER_IM2COL=off`. `GGML_CUDA_KEPLER_TRACE=1` prints
+which kernel ran. The compatibility port targets old CUDA toolkits and old GPUs and was tested only on the GTX 650 Ti.
 
 ## Measured speeds
 
